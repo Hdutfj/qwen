@@ -1,6 +1,7 @@
 """
 FastAPI Backend for Home Object Detection
 This server handles image uploads, runs object detection, and returns processed images with bounding boxes.
+Updated with logging for number of detections.
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse, JSONResponse
@@ -113,6 +114,8 @@ async def detect_objects(image: UploadFile = File(...), confidence_threshold: fl
         with torch.no_grad():
             detections = model.predict(input_tensor, conf_thresh=confidence_threshold)
         
+        logger.info(f"Detected {len(detections[0])} objects in the image")
+        
         # Draw bounding boxes on the original image
         result_img = draw_bounding_boxes(img, detections[0])
         
@@ -172,6 +175,8 @@ async def detect_objects_multiple(images: List[UploadFile] = File(...), confiden
             # Run inference
             with torch.no_grad():
                 detections = model.predict(input_tensor, conf_thresh=confidence_threshold)
+            
+            logger.info(f"Detected {len(detections[0])} objects in {image.filename}")
             
             # Draw bounding boxes on the original image
             result_img = draw_bounding_boxes(img, detections[0])
