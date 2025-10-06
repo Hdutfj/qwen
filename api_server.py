@@ -82,7 +82,7 @@ def process_single_image_openai(img: Image.Image):
                     "content": [
                         {
                             "type": "text", 
-                            "text": "Analyze this image and identify all objects present with their approximate locations. Return a JSON response with the following structure: {\"objects\": [{\"name\": \"object_name\", \"confidence\": 0.95, \"position\": \"position_in_image\", \"size_ratio\": 0.2}]}. Position can be 'top-left', 'top-center', 'top-right', 'middle-left', 'center', 'middle-right', 'bottom-left', 'bottom-center', 'bottom-right'. Size_ratio represents approximate space the object occupies (0.0 to 1.0). Common objects to look for include: chair, table, sofa, bed, desk, lamp, mirror, window, door, curtain, bookshelf, TV, refrigerator, microwave, stove, sink, toilet, bathtub, shower, towel, pillow, painting, plant, cup, bottle, and any other common household items. Only respond with the JSON object and nothing else."
+                            "text": "Analyze this image in detail and identify each object with its specific location. Return a JSON response with the following structure: {\"objects\": [{\"name\": \"object_name\", \"confidence\": 0.95, \"position\": {\"x\": 0.3, \"y\": 0.7, \"width\": 0.2, \"height\": 0.3}}]}. The position coordinates should be normalized between 0 and 1, where (0,0) is top-left and (1,1) is bottom-right of the image. For example, x=0.3 means 30% from the left edge, y=0.7 means 70% from the top edge. Common objects to look for include: chair, table, sofa, bed, desk, lamp, mirror, window, door, curtain, bookshelf, TV, refrigerator, microwave, stove, sink, toilet, bathtub, shower, towel, pillow, painting, plant, cup, bottle, and any other common household items. Only respond with the JSON object and nothing else."
                         },
                         {
                             "type": "image_url",
@@ -125,31 +125,76 @@ def process_single_image_openai(img: Image.Image):
                 # If no JSON found, just return the text as a single object
                 detected_objects = [{"name": result_text.strip(), "confidence": 0.5}]
         
-        # Format as detection results (without bounding boxes since OpenAI doesn't provide them)
+        # Format as detection results (with potential bounding box data if available)
         detection_results = []
         for obj in detected_objects:
             if isinstance(obj, dict):
-                # If obj is a dictionary with name, confidence, position, and size_ratio
+                # If obj is a dictionary with name, confidence, and position
                 class_name = obj.get("name", "")
                 confidence = obj.get("confidence", 0.85)
-                position = obj.get("position", "unknown")
-                size_ratio = obj.get("size_ratio", 0.1)
+                
+                # Get position coordinates if available
+                position_data = obj.get("position", {})
+                if isinstance(position_data, dict) and all(k in position_data for k in ["x", "y", "width", "height"]):
+                    # We have detailed position data
+                    pos_x = position_data["x"]
+                    pos_y = position_data["y"]
+                    pos_width = position_data["width"]
+                    pos_height = position_data["height"]
+                    
+                    # Convert normalized coordinates to pixel coordinates
+                    x1 = int(pos_x * img.width)
+                    y1 = int(pos_y * img.height)
+                    box_width = int(pos_width * img.width)
+                    box_height = int(pos_height * img.height)
+                    x2 = x1 + box_width
+                    y2 = y1 + box_height
+                    
+                    # Calculate center and size
+                    center_x = (x1 + x2) / 2
+                    center_y = (y1 + y2) / 2
+                    size_w = x2 - x1
+                    size_h = y2 - y1
+                    
+                    # Calculate area percentage
+                    object_area = size_w * size_h
+                    total_area = img.width * img.height
+                    area_percentage = (object_area / total_area) * 100 if total_area > 0 else 0
+                    
+                    detection_results.append({
+                        "class": class_name,
+                        "confidence": confidence,
+                        "bbox": [x1, y1, x2, y2],  # Bounding box in pixel coordinates
+                        "center": [center_x, center_y],
+                        "size": [size_w, size_h],
+                        "area_percentage": area_percentage,
+                        "image_width": img.width,
+                        "image_height": img.height
+                    })
+                else:
+                    # Fallback if no detailed position data
+                    detection_results.append({
+                        "class": class_name,
+                        "confidence": confidence,
+                        "bbox": None,
+                        "center": None,
+                        "size": None,
+                        "area_percentage": None,
+                        "image_width": img.width,
+                        "image_height": img.height
+                    })
             else:
                 # If obj is just a string
                 class_name = str(obj)
                 confidence = 0.85  # Default confidence
-                position = "unknown"
-                size_ratio = 0.1  # Default size ratio
-            
-            if class_name and class_name.strip():  # Make sure the object name isn't empty
+                
                 detection_results.append({
                     "class": class_name,
                     "confidence": confidence,
-                    "position": position,
-                    "size_ratio": size_ratio,
-                    "bbox": None,  # OpenAI API doesn't provide bounding boxes in this usage
+                    "bbox": None,
                     "center": None,
                     "size": None,
+                    "area_percentage": None,
                     "image_width": img.width,
                     "image_height": img.height
                 })
@@ -169,27 +214,13 @@ def process_single_image_openai(img: Image.Image):
         return {"success": False, "error": str(e)}
 
 def draw_local_bounding_boxes(image, detections):
-    """Draw bounding boxes and labels on image based on detections - using position info from OpenAI when available"""
+    """Draw bounding boxes and labels on image based on detections - using actual coordinates when available from OpenAI"""
     if not detections:
         return image
     
     # Work with a copy of the image
     result_image = image.copy()
     draw = ImageDraw.Draw(result_image)
-    
-    # Define position mapping to coordinates
-    width, height = image.size
-    position_coords = {
-        "top-left": (width * 0.2, height * 0.2),
-        "top-center": (width * 0.5, height * 0.2),
-        "top-right": (width * 0.8, height * 0.2),
-        "middle-left": (width * 0.2, height * 0.5),
-        "center": (width * 0.5, height * 0.5),
-        "middle-right": (width * 0.8, height * 0.5),
-        "bottom-left": (width * 0.2, height * 0.8),
-        "bottom-center": (width * 0.5, height * 0.8),
-        "bottom-right": (width * 0.8, height * 0.8)
-    }
     
     # Define a color palette for different objects
     colors = [
@@ -199,52 +230,64 @@ def draw_local_bounding_boxes(image, detections):
     ]
     
     for i, det in enumerate(detections):
-        # Get position info from detection if available
-        position_str = det.get("position", "unknown")
-        size_ratio = det.get("size_ratio", 0.1)
-        
-        if position_str in position_coords:
-            x, y = position_coords[position_str]
-        else:
-            # Fallback to grid if position not provided
-            grid_rows = int(len(detections) ** 0.5) + 1
-            grid_cols = grid_rows
-            row = i // grid_cols
-            col = i % grid_cols
-            x = (col + 1) * width // (grid_cols + 1)
-            y = (row + 1) * height // (grid_rows + 1)
-        
         # Get color for this object
         color = colors[i % len(colors)]
         class_name = det.get("class", "Unknown")
         
-        # Calculate box size based on size_ratio
-        box_size = int(60 + (size_ratio * 100))  # Base size of 60 + adjustment for size ratio
-        x1, y1 = x - box_size//2, y - box_size//2
-        x2, y2 = x + box_size//2, y + box_size//2
+        # Check if we have actual bounding box coordinates
+        bbox = det.get("bbox", None)
         
-        # Draw rectangle
-        for thickness in range(3):
+        if bbox and len(bbox) == 4:
+            # We have actual coordinates from OpenAI
+            x1, y1, x2, y2 = bbox
+            # Ensure coordinates are within image bounds
+            x1 = max(0, min(x1, image.width))
+            y1 = max(0, min(y1, image.height))
+            x2 = max(0, min(x2, image.width))
+            y2 = max(0, min(y2, image.height))
+        else:
+            # Fallback to a grid layout if no coordinates available
+            grid_rows = int(len(detections) ** 0.5) + 1
+            grid_cols = grid_rows
+            row = i // grid_cols
+            col = i % grid_cols
+            
+            width, height = image.size
+            x = (col + 1) * width // (grid_cols + 1)
+            y = (row + 1) * height // (grid_rows + 1)
+            
+            # Draw bounding box (using a fixed size since we don't have coordinates)
+            box_size = 60
+            x1, y1 = x - box_size//2, y - box_size//2
+            x2, y2 = x + box_size//2, y + box_size//2
+        
+        # Draw rectangle with multiple outlines for visibility
+        for thickness in range(1, 4):
             draw.rectangle([x1-thickness, y1-thickness, x2+thickness, y2+thickness], 
                            outline=color, width=1)
         
-        # Draw label with background
+        # Draw label with background near the top-left of the bounding box
         try:
             font = ImageFont.load_default()
         except:
             font = None
 
         if font:
-            bbox = draw.textbbox((0, 0), class_name, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
+            bbox_text = draw.textbbox((0, 0), class_name, font=font)
+            text_width = bbox_text[2] - bbox_text[0]
+            text_height = bbox_text[3] - bbox_text[1]
         else:
             text_width, text_height = len(class_name) * 6, 11
 
+        # Position label near the top-left of the bounding box
+        label_x = max(0, x1)
         label_y = max(0, y1 - text_height - 5)
-        draw.rectangle([x1, label_y, x1 + text_width + 10, label_y + text_height + 5], 
+        
+        # Draw background rectangle for label
+        draw.rectangle([label_x, label_y, label_x + text_width + 10, label_y + text_height + 5], 
                        fill=color)
-        draw.text((x1 + 5, label_y + 2), class_name, fill='white', font=font)
+        # Draw text
+        draw.text((label_x + 5, label_y + 2), class_name, fill='white', font=font)
     
     return result_image
 
