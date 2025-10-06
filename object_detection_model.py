@@ -1,7 +1,6 @@
 """
-Object Detection Model for Home Objects - YOLO-style Implementation
-This file contains an improved model architecture and training pipeline for object detection
-with bounding boxes instead of just image classification.
+Enhanced Object Detection Model - Fast Training YOLO Implementation
+Optimized for speed, accuracy, and expanded object detection capabilities
 """
 import torch
 import torch.nn as nn
@@ -13,7 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import sys
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import json
 import warnings
 from typing import Tuple, List, Optional, Dict
@@ -22,711 +21,768 @@ import logging
 from pathlib import Path
 import glob
 import random
-
+# import cv2 # Not needed for basic functionality
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
-
-# Define the classes for home objects
+# Expanded COCO-style classes for better object detection
 HOME_OBJECTS = [
-    'chair', 'sofa', 'bed', 'dining_table', 'toilet', 
-    'tv', 'laptop', 'mouse', 'oven', 'toaster', 
-    'refrigerator', 'book', 'clock', 'vase', 'window'
+    'toilet',
+    'sink',
+    'mirror',
+    'bathtub',
+    'showerhead',
+    'towel',
+    'toothbrush',
+    'toothpaste',
+    'soap_bar',
+    'shampoo_bottle',
+    'conditioner_bottle',
+    'handwash_bottle',
+    'toilet_paper_roll',
+    'towel_rack',
+    'bath_mat',
+    'hair_dryer',
+    'razor',
+    'lotion_bottle',
+    'trash_bin',
+    'shower_curtain',
+    'comb',
+    'cleaning_brush',
+    'bucket',
+    'mug',
+    'bathroom_shelf'
 ]
-
 NUM_CLASSES = len(HOME_OBJECTS)
-
-class YOLOHead(nn.Module):
-    """YOLO-style detection head"""
-    def __init__(self, in_channels, num_classes, num_anchors=3):
-        super(YOLOHead, self).__init__()
-        self.num_classes = num_classes
-        self.num_anchors = num_anchors
-        out_channels = num_anchors * (5 + num_classes)  # 5 = x, y, w, h, confidence
-        
+class FastConvBlock(nn.Module):
+    """Fast convolution block with depthwise separable convolutions"""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(FastConvBlock, self).__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(256, out_channels, kernel_size=1)
+            # Depthwise convolution
+            nn.Conv2d(in_channels, in_channels, kernel_size, stride, padding, groups=in_channels, bias=False),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU6(inplace=True),
+            # Pointwise convolution
+            nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU6(inplace=True)
         )
-    
+   
     def forward(self, x):
         return self.conv(x)
-
-class YOLOBackbone(nn.Module):
-    """YOLO-style backbone with feature pyramid"""
-    def __init__(self, num_classes, num_anchors=3):
-        super(YOLOBackbone, self).__init__()
+class FastYOLOBackbone(nn.Module):
+    """Lightweight YOLO backbone optimized for speed"""
+    def __init__(self):
+        super(FastYOLOBackbone, self).__init__()
+       
+        # Initial convolution
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU6(inplace=True)
+        )
+       
+        # Downsampling layers with fast conv blocks
+        self.layer1 = nn.Sequential(
+            nn.MaxPool2d(2, 2), # 416 -> 208
+            FastConvBlock(32, 64)
+        )
+       
+        self.layer2 = nn.Sequential(
+            nn.MaxPool2d(2, 2), # 208 -> 104
+            FastConvBlock(64, 128)
+        )
+       
+        self.layer3 = nn.Sequential(
+            nn.MaxPool2d(2, 2), # 104 -> 52
+            FastConvBlock(128, 256)
+        )
+       
+        self.layer4 = nn.Sequential(
+            nn.MaxPool2d(2, 2), # 52 -> 26
+            FastConvBlock(256, 512)
+        )
+       
+        self.layer5 = nn.Sequential(
+            nn.MaxPool2d(2, 2), # 26 -> 13
+            FastConvBlock(512, 512)
+        )
+       
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.layer5(x)
+        return x
+class YOLODetectionHead(nn.Module):
+    """YOLO detection head with multiple scales"""
+    def __init__(self, in_channels, num_classes, num_anchors=3):
+        super(YOLODetectionHead, self).__init__()
         self.num_classes = num_classes
         self.num_anchors = num_anchors
-        
-        # Feature extraction backbone
-        # Input: 416x416x3
-        self.backbone = nn.Sequential(
-            # Block 1: 416x416 -> 208x208
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 416 -> 208
-            
-            # Block 2: 208x208 -> 104x104
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 208 -> 104
-            
-            # Block 3: 104x104 -> 52x52
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(128, 64, kernel_size=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 104 -> 52
-            
-            # Block 4: 52x52 -> 26x26
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+       
+        # Output: (x, y, w, h, confidence, class_probs)
+        out_channels = num_anchors * (5 + num_classes)
+       
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 256, 3, 1, 1, bias=False),
             nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(256, 128, kernel_size=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 52 -> 26
-            
-            # Block 5: 26x26 -> 13x13
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(512, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(512, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.1),
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.1),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 26 -> 13
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(256, out_channels, 1, 1, 0)
         )
-        
-        # YOLO head
-        self.yolo_head = YOLOHead(512, num_classes, num_anchors)
-        
+       
     def forward(self, x):
-        # Extract features
-        features = self.backbone(x)
-        
-        # Apply the detection head
-        output = self.yolo_head(features)
-        
-        return output
-
+        return self.conv(x)
 class HomeObjectDetectionModel(nn.Module):
-    """
-    Object detection model for home objects using YOLO-style architecture
-    """
+    """Fast Object Detection Model optimized for training speed and accuracy"""
     def __init__(self, num_classes=NUM_CLASSES, num_anchors=3):
         super(HomeObjectDetectionModel, self).__init__()
         self.num_classes = num_classes
         self.num_anchors = num_anchors
-        self.grid_size = 13  # For 416 / 32 = 13
-        
-        # Define anchors (normalized w, h) - can be tuned based on dataset
-        self.anchors = torch.tensor([[0.1, 0.1], [0.3, 0.3], [0.5, 0.5]])
-        
-        # Use YOLO backbone
-        self.backbone = YOLOBackbone(num_classes, num_anchors)
-        
-        # Initialize weights
+        self.grid_size = 13
+       
+        # Optimized anchor boxes for common objects
+        self.anchors = torch.tensor([
+            [0.28, 0.22], [0.38, 0.48], [0.90, 0.78], # Small, medium, large
+        ]) / self.grid_size
+       
+        # Fast backbone
+        self.backbone = FastYOLOBackbone()
+       
+        # Detection head
+        self.detection_head = YOLODetectionHead(512, num_classes, num_anchors)
+       
+        # Initialize weights for faster convergence
         self._initialize_weights()
-    
+   
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
-    
+   
     def forward(self, x):
-        return self.backbone(x)
-
-    def predict(self, x, conf_thresh=0.5, nms_thresh=0.4):
-        """
-        Perform object detection and return bounding boxes
-        """
-        # Forward pass
-        outputs = self.forward(x)
-        
-        # Process outputs to get bounding boxes
-        batch_size, _, grid_h, grid_w = outputs.shape  # grid_h, grid_w should be 13, 13
-        anchor_step = 5 + self.num_classes  # x, y, w, h, conf, class_probs
-        
-        # Reshape to separate anchors, boxes, class scores
-        outputs = outputs.view(batch_size, self.num_anchors, anchor_step, grid_h, grid_w)
-        outputs = outputs.permute(0, 1, 3, 4, 2).contiguous()
-        
-        # Extract box coordinates and confidence
-        box_xy = torch.sigmoid(outputs[..., :2])  # x, y (center coordinates)
-        box_wh = torch.exp(outputs[..., 2:4])  # w, h (exponential for scale)
-        conf = torch.sigmoid(outputs[..., 4])     # confidence
-        cls_scores = torch.softmax(outputs[..., 5:], dim=-1)  # class scores
-        
-        # Apply anchors to wh
-        anchors = self.anchors.to(box_wh.device)
-        box_wh *= anchors.view(1, self.num_anchors, 1, 1, 2)
-        
-        # Apply confidence threshold
-        mask = conf > conf_thresh
-        
-        # Collect detections
-        detections = []
-        for b in range(batch_size):
-            batch_detections = []
-            for a in range(self.num_anchors):
-                for i in range(grid_h):
-                    for j in range(grid_w):
-                        if mask[b, a, i, j]:
-                            # Calculate actual box coordinates (normalized 0-1)
-                            x = (box_xy[b, a, i, j, 0] + j) / grid_w
-                            y = (box_xy[b, a, i, j, 1] + i) / grid_h
-                            w = box_wh[b, a, i, j, 0]
-                            h = box_wh[b, a, i, j, 1]
-                            
-                            # Get class prediction
-                            cls_prob, cls_id = torch.max(cls_scores[b, a, i, j], dim=0)
-                            
-                            confidence = conf[b, a, i, j]
-                            
-                            batch_detections.append([
-                                x.item(), y.item(), w.item(), h.item(),
-                                confidence.item(), cls_id.item()
-                            ])
-            
-            # Apply NMS
-            batch_detections = self._nms(batch_detections, nms_thresh)
-            detections.append(batch_detections)
-        
+        features = self.backbone(x)
+        detections = self.detection_head(features)
         return detections
-
-    def _nms(self, boxes, nms_thresh):
-        """Non-Maximum Suppression"""
+   
+    def predict(self, x, conf_thresh=0.25, nms_thresh=0.45):
+        """Fast prediction with optimized NMS"""
+        self.eval()
+        with torch.no_grad():
+            outputs = self.forward(x)
+           
+            batch_size, output_channels, grid_h, grid_w = outputs.shape
+            anchor_step = 5 + self.num_classes
+            num_anchors = output_channels // anchor_step
+           
+            # Reshape outputs
+            outputs = outputs.view(batch_size, num_anchors, anchor_step, grid_h, grid_w)
+            outputs = outputs.permute(0, 1, 3, 4, 2).contiguous()
+           
+            # Extract predictions
+            pred_xy = torch.sigmoid(outputs[..., :2])
+            pred_wh = outputs[..., 2:4]
+            pred_conf = torch.sigmoid(outputs[..., 4])
+            pred_cls = torch.softmax(outputs[..., 5:], dim=-1)
+           
+            # Apply anchors
+            anchors = self.anchors.to(pred_wh.device)
+            anchors_expanded = anchors.view(1, num_anchors, 1, 1, 2)
+            pred_wh = torch.exp(pred_wh) * anchors_expanded
+           
+            # Convert to absolute coordinates
+            detections = []
+            for b in range(batch_size):
+                batch_detections = []
+               
+                # Vectorized detection extraction
+                conf_mask = pred_conf[b] > conf_thresh
+               
+                for a in range(num_anchors):
+                    for i in range(grid_h):
+                        for j in range(grid_w):
+                            if conf_mask[a, i, j]:
+                                # Calculate coordinates
+                                x = (pred_xy[b, a, i, j, 0] + j) / grid_w
+                                y = (pred_xy[b, a, i, j, 1] + i) / grid_h
+                                w = pred_wh[b, a, i, j, 0] / grid_w
+                                h = pred_wh[b, a, i, j, 1] / grid_h
+                               
+                                # Clamp coordinates
+                                x = torch.clamp(x, 0.0, 1.0).item()
+                                y = torch.clamp(y, 0.0, 1.0).item()
+                                w = torch.clamp(w, 0.0, 1.0).item()
+                                h = torch.clamp(h, 0.0, 1.0).item()
+                               
+                                if w > 0.01 and h > 0.01: # Minimum size filter
+                                    conf = pred_conf[b, a, i, j].item()
+                                    cls_prob, cls_id = torch.max(pred_cls[b, a, i, j], dim=0)
+                                   
+                                    batch_detections.append([
+                                        x, y, w, h, conf * cls_prob.item(), cls_id.item()
+                                    ])
+               
+                # Apply fast NMS
+                batch_detections = self._fast_nms(batch_detections, nms_thresh)
+                detections.append(batch_detections)
+           
+            return detections
+   
+    def _fast_nms(self, boxes, nms_thresh):
+        """Optimized NMS implementation"""
         if len(boxes) == 0:
             return []
-        
-        # Convert to tensors
-        boxes_tensor = torch.tensor(boxes)
-        x1 = boxes_tensor[:, 0] - boxes_tensor[:, 2] / 2  # xmin
-        y1 = boxes_tensor[:, 1] - boxes_tensor[:, 3] / 2  # ymin
-        x2 = boxes_tensor[:, 0] + boxes_tensor[:, 2] / 2  # xmax
-        y2 = boxes_tensor[:, 1] + boxes_tensor[:, 3] / 2  # ymax
-        scores = boxes_tensor[:, 4]
-        
-        areas = (x2 - x1) * (y2 - y1)
-        order = scores.argsort(descending=True)
-        
+       
+        # Sort by confidence
+        boxes = sorted(boxes, key=lambda x: x[4], reverse=True)
+       
         keep = []
-        while order.numel() > 0:
-            if order.numel() == 1:
-                i = order.item()
-                keep.append(i)
-                break
-            
-            i = order[0].item()
-            keep.append(i)
-            
-            # Get intersection coordinates
-            xx1 = torch.max(x1[i], x1[order[1:]])
-            yy1 = torch.max(y1[i], y1[order[1:]])
-            xx2 = torch.min(x2[i], x2[order[1:]])
-            yy2 = torch.min(y2[i], y2[order[1:]])
-            
-            # Compute intersection area
-            w = torch.clamp(xx2 - xx1, min=0)
-            h = torch.clamp(yy2 - yy1, min=0)
-            inter = w * h
-            
-            # Compute IoU
-            iou = inter / (areas[i] + areas[order[1:]] - inter)
-            
-            # Keep boxes with IoU less than threshold
-            idx = (iou <= nms_thresh).nonzero().squeeze()
-            if idx.numel() == 0:
-                break
-            order = order[idx + 1]
-        
-        return [boxes[i] for i in keep]
-
+        while boxes:
+            current = boxes.pop(0)
+            keep.append(current)
+           
+            # Filter overlapping boxes
+            boxes = [box for box in boxes if self._calculate_iou(current, box) < nms_thresh]
+       
+        return keep
+   
+    def _calculate_iou(self, box1, box2):
+        """Fast IoU calculation"""
+        x1, y1, w1, h1 = box1[:4]
+        x2, y2, w2, h2 = box2[:4]
+       
+        # Convert to corner coordinates
+        x1_min, y1_min = x1 - w1/2, y1 - h1/2
+        x1_max, y1_max = x1 + w1/2, y1 + h1/2
+        x2_min, y2_min = x2 - w2/2, y2 - h2/2
+        x2_max, y2_max = x2 + w2/2, y2 + h2/2
+       
+        # Calculate intersection
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+       
+        if inter_x_max <= inter_x_min or inter_y_max <= inter_y_min:
+            return 0.0
+       
+        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+        box1_area = w1 * h1
+        box2_area = w2 * h2
+        union_area = box1_area + box2_area - inter_area
+       
+        return inter_area / (union_area + 1e-6)
 def draw_bounding_boxes(image, detections, class_names=HOME_OBJECTS):
-    """
-    Draw bounding boxes on an image
-    """
-    from PIL import ImageDraw, ImageFont
-    
-    # Convert to PIL image if it's a tensor
+    """Enhanced bounding box drawing with better visualization"""
     if isinstance(image, torch.Tensor):
-        # Denormalize and convert to PIL
+        # Convert tensor to PIL
         image = image.cpu().detach()
-        image = image.permute(1, 2, 0)  # CHW to HWC
-        # Denormalize assuming ImageNet normalization
+        if image.dim() == 4:
+            image = image.squeeze(0)
+        image = image.permute(1, 2, 0)
+        # Denormalize
         image = image * torch.tensor([0.229, 0.224, 0.225]) + torch.tensor([0.485, 0.456, 0.406])
         image = torch.clamp(image, 0, 1)
-        image = (image * 255).byte()
-        image = Image.fromarray(image.numpy())
-    
+        image = (image * 255).byte().numpy()
+        image = Image.fromarray(image)
+   
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+   
     draw = ImageDraw.Draw(image)
-    
-    # Draw each detection
-    for det in detections:
+   
+    # Enhanced color palette
+    colors = [
+        '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7',
+        '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E9',
+        '#F8C471', '#82E0AA', '#F1948A', '#85C1E9', '#D7BDE2'
+    ] * 10 # Repeat for more classes
+   
+    for i, det in enumerate(detections):
         x_center, y_center, width, height, conf, cls_id = det
+       
+        # Convert to pixel coordinates
         x1 = int((x_center - width/2) * image.width)
         y1 = int((y_center - height/2) * image.height)
         x2 = int((x_center + width/2) * image.width)
         y2 = int((y_center + height/2) * image.height)
-        
-        # Draw bounding box
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
-        
-        # Draw label
-        label = f"{class_names[int(cls_id)]}: {conf:.2f}"
-        draw.text((x1, y1 - 10), label, fill="red")
-    
+       
+        # Clamp to image bounds
+        x1 = max(0, min(x1, image.width))
+        y1 = max(0, min(y1, image.height))
+        x2 = max(0, min(x2, image.width))
+        y2 = max(0, min(y2, image.height))
+       
+        if x1 >= x2 or y1 >= y2:
+            continue
+       
+        # Get color and class name
+        color = colors[int(cls_id) % len(colors)]
+        class_name = class_names[int(cls_id)] if int(cls_id) < len(class_names) else f"class_{int(cls_id)}"
+       
+        # Draw thick bounding box
+        for thickness in range(3):
+            draw.rectangle([x1-thickness, y1-thickness, x2+thickness, y2+thickness],
+                         outline=color, width=1)
+       
+        # Draw label with background
+        label = f"{class_name}: {conf:.2f}"
+       
+        try:
+            font = ImageFont.load_default()
+        except:
+            font = None
+       
+        # Get text size
+        if font:
+            bbox = draw.textbbox((0, 0), label, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+        else:
+            text_width, text_height = len(label) * 6, 11
+       
+        # Draw label background
+        label_y = max(0, y1 - text_height - 5)
+        draw.rectangle([x1, label_y, x1 + text_width + 10, label_y + text_height + 5],
+                      fill=color)
+       
+        # Draw text
+        draw.text((x1 + 5, label_y + 2), label, fill='white', font=font)
+   
     return image
-
-class HomeObjectsDetectionDataset(Dataset):
-    """
-    Custom dataset for home object detection with bounding box annotations
-    Loads annotations from .txt files if available, otherwise creates synthetic
-    """
-    def __init__(self, images_dir, transform=None):
+class FastDetectionDataset(Dataset):
+    """Optimized dataset for fast loading and training"""
+    def __init__(self, images_dir, transform=None, cache_images=True):
         self.images_dir = Path(images_dir)
         self.transform = transform
-        
-        # Get all image files
+        self.cache_images = cache_images
+        self.image_cache = {}
+       
+        # Find all image files
         self.image_paths = []
-        valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
-        
-        for ext in valid_extensions:
-            self.image_paths.extend(self.images_dir.glob(f"**/*{ext}"))  # Include subdirs
-        
-        self.image_paths = sorted(self.image_paths)  # For consistency
-        logger.info(f"Found {len(self.image_paths)} images")
-    
+        for ext in ['.jpg', '.jpeg', '.png', '.bmp']:
+            self.image_paths.extend(self.images_dir.glob(f"**/*{ext}"))
+            self.image_paths.extend(self.images_dir.glob(f"**/*{ext.upper()}"))
+       
+        self.image_paths = sorted(self.image_paths)
+        logger.info(f"Found {len(self.image_paths)} images in {images_dir}")
+       
+        # Pre-cache small dataset for faster training
+        if cache_images and len(self.image_paths) < 1000:
+            logger.info("Pre-caching images for faster training...")
+            for i, img_path in enumerate(self.image_paths):
+                if i % 100 == 0:
+                    logger.info(f"Cached {i}/{len(self.image_paths)} images")
+                try:
+                    image = Image.open(img_path).convert('RGB')
+                    self.image_cache[str(img_path)] = image
+                except Exception as e:
+                    logger.warning(f"Error caching {img_path}: {e}")
+   
     def __len__(self):
         return len(self.image_paths)
-    
+   
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            logger.warning(f"Error opening {img_path}: {e}. Using dummy image.")
-            image = Image.new('RGB', (416, 416), color='gray')
-        
-        bounding_boxes = []
-        
-        # Try to load annotation file
+       
+        # Load from cache or disk
+        if str(img_path) in self.image_cache:
+            image = self.image_cache[str(img_path)]
+        else:
+            try:
+                image = Image.open(img_path).convert('RGB')
+            except Exception as e:
+                logger.warning(f"Error loading {img_path}: {e}")
+                image = Image.new('RGB', (416, 416), color='gray')
+       
+        # Load annotations
+        annotations = self._load_annotations(img_path)
+       
+        # Apply transforms
+        if self.transform:
+            image = self.transform(image)
+       
+        return image, annotations
+   
+    def _load_annotations(self, img_path):
+        """Load YOLO format annotations or create synthetic ones"""
         ann_path = img_path.with_suffix('.txt')
+       
         if ann_path.exists():
+            # Load real annotations
+            annotations = []
             try:
                 with open(ann_path, 'r') as f:
                     for line in f:
                         parts = line.strip().split()
-                        if len(parts) == 5:
+                        if len(parts) >= 5:
                             cls_id = int(parts[0])
-                            x = float(parts[1])
-                            y = float(parts[2])
-                            w = float(parts[3])
-                            h = float(parts[4])
-                            if 0 <= cls_id < NUM_CLASSES and 0 < w <= 1 and 0 < h <= 1:
-                                bounding_boxes.append([x, y, w, h, cls_id])
+                            x_center = float(parts[1])
+                            y_center = float(parts[2])
+                            width = float(parts[3])
+                            height = float(parts[4])
+                            annotations.append([x_center, y_center, width, height, cls_id])
             except Exception as e:
-                logger.warning(f"Error reading annotation {ann_path}: {e}")
-        
-        # If no annotations found, create synthetic for demonstration
-        if not bounding_boxes:
-            num_objects = random.randint(1, 3)
-            for _ in range(num_objects):
-                cls_id = random.randint(0, NUM_CLASSES - 1)
-                w = random.uniform(0.1, 0.4)
-                h = random.uniform(0.1, 0.4)
-                x = random.uniform(w / 2, 1 - w / 2)
-                y = random.uniform(h / 2, 1 - h / 2)
-                bounding_boxes.append([x, y, w, h, cls_id])
-        
-        # Apply transforms
-        if self.transform:
-            image = self.transform(image)
+                logger.warning(f"Error loading annotations from {ann_path}: {e}")
         else:
-            default_transform = transforms.Compose([
-                transforms.Resize((416, 416)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-            image = default_transform(image)
-        
-        # Return image and list of boxes (variable length)
-        boxes = torch.tensor(bounding_boxes, dtype=torch.float32) if bounding_boxes else torch.zeros((0, 5))
-        return image, boxes
-
-def collate_fn(batch):
-    images = torch.stack([item[0] for item in batch])
-    boxes = [item[1] for item in batch]
-    return images, boxes
-
-def get_detection_transforms():
-    """Get data transforms for object detection"""
+            # Create synthetic annotations for training
+            annotations = self._create_synthetic_annotations()
+       
+        return torch.tensor(annotations, dtype=torch.float32)
+   
+    def _create_synthetic_annotations(self):
+        """Create synthetic annotations for images without labels"""
+        num_objects = random.randint(1, 3)
+        annotations = []
+       
+        for _ in range(num_objects):
+            # Random object parameters
+            x_center = random.uniform(0.1, 0.9)
+            y_center = random.uniform(0.1, 0.9)
+            width = random.uniform(0.05, 0.3)
+            height = random.uniform(0.05, 0.3)
+            cls_id = random.randint(0, NUM_CLASSES - 1)
+           
+            annotations.append([x_center, y_center, width, height, cls_id])
+       
+        return annotations
+def get_fast_transforms():
+    """Optimized transforms for faster training"""
     train_transform = transforms.Compose([
         transforms.Resize((416, 416)),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
+   
     val_transform = transforms.Compose([
         transforms.Resize((416, 416)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
+   
     return train_transform, val_transform
-
-def yolo_loss(predictions, targets, model):
-    """
-    YOLO loss function (improved to handle variable boxes and proper components)
-    """
+def collate_fn(batch):
+    """Custom collate function for variable-length annotations"""
+    images, targets = zip(*batch)
+    images = torch.stack(images, 0)
+    return images, list(targets)
+def fast_yolo_loss(predictions, targets, model, lambda_coord=5.0, lambda_noobj=0.5):
+    """Optimized YOLO loss function"""
     device = predictions.device
-    lambda_coord = 5.0
-    lambda_noobj = 0.5
-    batch_size, _, grid_h, grid_w = predictions.shape
+    batch_size, output_channels, grid_h, grid_w = predictions.shape
     num_anchors = model.num_anchors
     num_classes = model.num_classes
-    anchors = model.anchors.to(device)
-    
+   
     # Reshape predictions
     anchor_step = 5 + num_classes
     pred = predictions.view(batch_size, num_anchors, anchor_step, grid_h, grid_w)
     pred = pred.permute(0, 1, 3, 4, 2).contiguous()
-    
+   
     # Extract components
-    pred_xy = torch.sigmoid(pred[..., :2])  # x, y
-    pred_wh = pred[..., 2:4]                # w, h (log scale)
-    pred_conf = torch.sigmoid(pred[..., 4]) # confidence
-    pred_cls = torch.softmax(pred[..., 5:], dim=-1)  # class probabilities
-    
-    # Initialize targets
-    obj_mask = torch.zeros(batch_size, num_anchors, grid_h, grid_w, device=device)
-    noobj_mask = torch.ones(batch_size, num_anchors, grid_h, grid_w, device=device)
-    target_xy = torch.zeros(batch_size, num_anchors, grid_h, grid_w, 2, device=device)
-    target_wh = torch.zeros(batch_size, num_anchors, grid_h, grid_w, 2, device=device)
-    target_cls = torch.zeros(batch_size, num_anchors, grid_h, grid_w, dtype=torch.long, device=device) - 1  # -1 for no obj
-    
+    pred_xy = torch.sigmoid(pred[..., :2])
+    pred_wh = pred[..., 2:4]
+    pred_conf = torch.sigmoid(pred[..., 4])
+    pred_cls = pred[..., 5:]
+   
+    # Initialize loss components
+    loss_xy = torch.tensor(0.0, device=device)
+    loss_wh = torch.tensor(0.0, device=device)
+    loss_conf = torch.tensor(0.0, device=device)
+    loss_cls = torch.tensor(0.0, device=device)
+   
+    total_objects = 0
+   
     for b in range(batch_size):
         if len(targets[b]) == 0:
+            # No objects penalty
+            loss_conf += lambda_noobj * torch.sum(pred_conf[b] ** 2)
             continue
+       
         gt_boxes = targets[b].to(device)
+       
         for gt in gt_boxes:
+            if len(gt) < 5:
+                continue
+           
             gt_x, gt_y, gt_w, gt_h, gt_cls = gt
+           
             if gt_w <= 0 or gt_h <= 0:
                 continue
-            
+           
+            # Find grid cell
             cell_x = int(gt_x * grid_w)
             cell_y = int(gt_y * grid_h)
-            gt_offset_x = gt_x * grid_w - cell_x
-            gt_offset_y = gt_y * grid_h - cell_y
-            
-            # Find best anchor
-            best_iou = 0
-            best_a = 0
-            for a in range(num_anchors):
-                anchor_w, anchor_h = anchors[a]
-                min_w = min(gt_w, anchor_w)
-                min_h = min(gt_h, anchor_h)
-                inter = min_w * min_h
-                union = gt_w * gt_h + anchor_w * anchor_h - inter + 1e-16
-                iou = inter / union
-                if iou > best_iou:
-                    best_iou = iou
-                    best_a = a
-            
-            # Assign if better than threshold or always assign to best
-            obj_mask[b, best_a, cell_y, cell_x] = 1
-            noobj_mask[b, best_a, cell_y, cell_x] = 0
-            target_xy[b, best_a, cell_y, cell_x] = torch.tensor([gt_offset_x, gt_offset_y], device=device)
-            target_wh[b, best_a, cell_y, cell_x] = torch.tensor([torch.log(gt_w / anchors[best_a][0] + 1e-16),
-                                                                  torch.log(gt_h / anchors[best_a][1] + 1e-16)], device=device)
-            target_cls[b, best_a, cell_y, cell_x] = int(gt_cls)
-    
-    # Losses
-    obj_indices = obj_mask > 0
-    noobj_indices = noobj_mask > 0
-    
-    # Coord losses
-    loss_xy = lambda_coord * torch.mean(obj_mask * ((pred_xy - target_xy) ** 2).sum(-1))
-    loss_wh = lambda_coord * torch.mean(obj_mask * ((pred_wh - target_wh) ** 2).sum(-1))
-    
-    # Confidence losses
-    loss_conf_obj = torch.mean(obj_mask * ((pred_conf - 1) ** 2))
-    loss_conf_noobj = lambda_noobj * torch.mean(noobj_mask * (pred_conf ** 2))
-    
-    # Class loss (using cross-entropy like)
-    loss_cls = 0
-    if (target_cls >= 0).any():
-        valid_cls = target_cls >= 0
-        selected_pred_cls = pred_cls[valid_cls]
-        selected_target_cls = target_cls[valid_cls]
-        loss_cls = -torch.mean(torch.log(selected_pred_cls[torch.arange(selected_pred_cls.size(0)), selected_target_cls] + 1e-16))
-    
-    total_loss = loss_xy + loss_wh + loss_conf_obj + loss_conf_noobj + loss_cls
+            cell_x = min(cell_x, grid_w - 1)
+            cell_y = min(cell_y, grid_h - 1)
+           
+            # Find best anchor (simplified)
+            best_anchor = 0
+           
+            # Calculate targets
+            target_x = gt_x * grid_w - cell_x
+            target_y = gt_y * grid_h - cell_y
+           
+            # Add losses
+            loss_xy += lambda_coord * ((pred_xy[b, best_anchor, cell_y, cell_x, 0] - target_x) ** 2 +
+                                     (pred_xy[b, best_anchor, cell_y, cell_x, 1] - target_y) ** 2)
+           
+            loss_wh += lambda_coord * ((pred_wh[b, best_anchor, cell_y, cell_x, 0] - torch.log(gt_w + 1e-16)) ** 2 +
+                                     (pred_wh[b, best_anchor, cell_y, cell_x, 1] - torch.log(gt_h + 1e-16)) ** 2)
+           
+            loss_conf += (pred_conf[b, best_anchor, cell_y, cell_x] - 1) ** 2
+           
+            # Class loss
+            target_cls = torch.zeros(num_classes, device=device)
+            target_cls[int(gt_cls)] = 1
+            loss_cls += torch.sum((torch.softmax(pred_cls[b, best_anchor, cell_y, cell_x], dim=0) - target_cls) ** 2)
+           
+            total_objects += 1
+   
+    # Background confidence loss
+    loss_conf += lambda_noobj * torch.sum(pred_conf ** 2) / (batch_size * num_anchors * grid_h * grid_w)
+   
+    # Normalize losses
+    if total_objects > 0:
+        loss_xy /= total_objects
+        loss_wh /= total_objects
+        loss_cls /= total_objects
+   
+    total_loss = loss_xy + loss_wh + loss_conf + loss_cls
     return total_loss
-
-def train_detection_model(model, train_loader, val_loader, num_epochs=20, learning_rate=0.001, save_path='best_detection_model.pth'):
-    """
-    Train the object detection model
-    """
+def train_fast_detection_model(model, train_loader, val_loader, num_epochs=10, learning_rate=0.001, save_path='best_detection_model.pth'):
+    """Fast training with optimizations"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    
+    logger.info(f"Training on device: {device}")
+   
     model.to(device)
-    
-    # Loss function and optimizer
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-    
-    # Training metrics
-    train_losses = []
-    
-    logger.info(f"Starting training for {num_epochs} epochs...")
-    
+   
+    # Optimized optimizer and scheduler
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=learning_rate, epochs=num_epochs,
+        steps_per_epoch=len(train_loader), pct_start=0.1
+    )
+   
+    # Mixed precision training for speed
+    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+   
+    best_loss = float('inf')
+   
+    logger.info(f"Starting fast training for {num_epochs} epochs...")
+   
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        
-        logger.info(f"Epoch {epoch+1}/{num_epochs}")
-        
+        num_batches = len(train_loader)
+       
+        start_time = time.time()
+       
         for batch_idx, (inputs, targets) in enumerate(train_loader):
-            inputs = inputs.to(device)
-            # Targets are list of tensors, move to device
-            targets = [t.to(device) for t in targets]
-            
+            inputs = inputs.to(device, non_blocking=True)
+            targets = [t.to(device, non_blocking=True) for t in targets]
+           
             optimizer.zero_grad()
-            
-            outputs = model(inputs)
-            loss = yolo_loss(outputs, targets, model)
-            
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            
+           
+            # Mixed precision forward pass
+            if scaler:
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    loss = fast_yolo_loss(outputs, targets, model)
+               
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(inputs)
+                loss = fast_yolo_loss(outputs, targets, model)
+                loss.backward()
+                optimizer.step()
+           
+            scheduler.step()
+           
             running_loss += loss.item()
-            
-            if batch_idx % 10 == 0:
-                logger.info(f"  Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}")
-        
-        avg_loss = running_loss / len(train_loader)
-        train_losses.append(avg_loss)
-        
-        logger.info(f"  Average Loss: {avg_loss:.4f}")
-        
-        # Save checkpoint
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': avg_loss,
-        }, save_path.replace('.pth', f'_epoch_{epoch+1}.pth'))
-        
-        # Update learning rate
-        scheduler.step(avg_loss)
-    
-    # Save final model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'train_losses': train_losses,
-        'class_names': HOME_OBJECTS,
-        'anchors': model.anchors
-    }, save_path)
-    
-    logger.info(f"Training completed! Model saved as {save_path}")
-    return train_losses
-
-def create_synthetic_detection_dataset(dataset_dir: str, num_images: int = 200, img_size=416):
-    """
-    Create synthetic dataset for object detection with bounding box annotations
-    Now also creates .txt annotation files in YOLO format
-    """
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        
-        dataset_path = Path(dataset_dir)
-        dataset_path.mkdir(exist_ok=True)
-        
-        logger.info(f"Creating synthetic detection dataset with {num_images} images...")
-        
-        for i in range(num_images):
-            # Create a synthetic image
-            img = Image.new('RGB', (img_size, img_size), 
-                            color=(random.randint(50, 200), 
-                                   random.randint(50, 200), 
-                                   random.randint(50, 200)))
-            
-            draw = ImageDraw.Draw(img)
-            
-            # Add random objects/bounding boxes
-            num_objects = random.randint(1, 3)
-            annotations = []
-            
-            for _ in range(num_objects):
-                # Random bounding box (pixels)
-                x1 = random.randint(50, img_size - 50)
-                y1 = random.randint(50, img_size - 50)
-                x2 = min(x1 + random.randint(30, 150), img_size - 10)
-                y2 = min(y1 + random.randint(30, 150), img_size - 10)
-                
-                # Random color for the object
-                color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-                
-                # Draw rectangle as "object"
-                draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-                
-                # Random class
-                cls_id = random.randint(0, len(HOME_OBJECTS)-1)
-                class_name = HOME_OBJECTS[cls_id]
-                
-                # Draw label
-                try:
-                    font = ImageFont.load_default()
-                    draw.text((x1, y1 - 10), class_name, fill=color, font=font)
-                except:
-                    draw.text((x1, y1 - 10), class_name, fill=color)
-                
-                # Compute normalized YOLO format
-                x_center = ((x1 + x2) / 2) / img_size
-                y_center = ((y1 + y2) / 2) / img_size
-                width = (x2 - x1) / img_size
-                height = (y2 - y1) / img_size
-                
-                annotations.append(f"{cls_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
-            
-            # Add random shapes for variety (no annotations for noise)
-            for _ in range(random.randint(2, 6)):
-                shape_type = random.choice(['rectangle', 'ellipse'])
-                x1 = random.randint(0, img_size - 50)
-                y1 = random.randint(0, img_size - 50)
-                x2 = min(x1 + random.randint(20, 60), img_size)
-                y2 = min(y1 + random.randint(20, 60), img_size)
-                color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-                
-                if shape_type == 'rectangle':
-                    draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-                else:
-                    draw.ellipse([x1, y1, x2, y2], outline=color, width=2)
-            
-            # Save image
-            img_path = dataset_path / f"synthetic_detection_{i:04d}.jpg"
-            img.save(img_path, 'JPEG', quality=85)
-            
-            # Save annotations
-            ann_path = img_path.with_suffix('.txt')
-            with open(ann_path, 'w') as f:
-                f.write('\n'.join(annotations))
-        
-        logger.info(f"Synthetic detection dataset created at {dataset_path} with annotations")
-        return True
-        
-    except ImportError:
-        logger.error("PIL not available for creating synthetic images")
-        return False
-    except Exception as e:
-        logger.error(f"Error creating synthetic dataset: {e}")
-        return False
-
+           
+            # Progress logging
+            if batch_idx % max(1, num_batches // 10) == 0:
+                progress = 100.0 * batch_idx / num_batches
+                logger.info(f"Epoch {epoch+1}/{num_epochs} [{progress:.1f}%] Loss: {loss.item():.4f}")
+       
+        avg_loss = running_loss / num_batches
+        epoch_time = time.time() - start_time
+       
+        logger.info(f"Epoch {epoch+1}/{num_epochs} completed in {epoch_time:.1f}s - Avg Loss: {avg_loss:.4f}")
+       
+        # Save best model
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+                'anchors': model.anchors,
+                'class_names': HOME_OBJECTS
+            }, save_path)
+            logger.info(f"New best model saved with loss: {avg_loss:.4f}")
+   
+    logger.info(f"Training completed! Best model saved as {save_path}")
+    return best_loss
+def create_sample_detection_dataset(dataset_dir: str, num_images: int = 100):
+    """Create sample dataset with realistic objects"""
+    dataset_path = Path(dataset_dir)
+    dataset_path.mkdir(exist_ok=True)
+   
+    logger.info(f"Creating sample detection dataset with {num_images} images...")
+   
+    # Common object colors and shapes
+    object_configs = {
+        'toilet': {'color': (255, 255, 255), 'shape': 'rect'},
+        'sink': {'color': (255, 255, 255), 'shape': 'rect'},
+        'mirror': {'color': (192, 192, 192), 'shape': 'rect'},
+        'bathtub': {'color': (255, 255, 255), 'shape': 'rect'},
+        'showerhead': {'color': (192, 192, 192), 'shape': 'ellipse'},
+        'towel': {'color': (173, 216, 230), 'shape': 'rect'},
+        'toothbrush': {'color': (255, 0, 0), 'shape': 'rect'},
+        'toothpaste': {'color': (0, 255, 0), 'shape': 'rect'},
+        'soap_bar': {'color': (255, 255, 0), 'shape': 'rect'},
+        'shampoo_bottle': {'color': (0, 0, 255), 'shape': 'rect'},
+        'conditioner_bottle': {'color': (255, 165, 0), 'shape': 'rect'},
+        'handwash_bottle': {'color': (128, 0, 128), 'shape': 'rect'},
+        'toilet_paper_roll': {'color': (255, 255, 255), 'shape': 'ellipse'},
+        'towel_rack': {'color': (192, 192, 192), 'shape': 'rect'},
+        'bath_mat': {'color': (173, 216, 230), 'shape': 'rect'},
+        'hair_dryer': {'color': (0, 0, 0), 'shape': 'rect'},
+        'razor': {'color': (192, 192, 192), 'shape': 'rect'},
+        'lotion_bottle': {'color': (255, 192, 203), 'shape': 'rect'},
+        'trash_bin': {'color': (105, 105, 105), 'shape': 'rect'},
+        'shower_curtain': {'color': (255, 255, 255), 'shape': 'rect'},
+        'comb': {'color': (0, 0, 0), 'shape': 'rect'},
+        'cleaning_brush': {'color': (139, 69, 19), 'shape': 'rect'},
+        'bucket': {'color': (255, 0, 0), 'shape': 'rect'},
+        'mug': {'color': (255, 255, 255), 'shape': 'ellipse'},
+        'bathroom_shelf': {'color': (160, 82, 45), 'shape': 'rect'}
+    }
+   
+    for i in range(num_images):
+        # Create background
+        img = Image.new('RGB', (416, 416),
+                       color=(random.randint(200, 255), random.randint(200, 255), random.randint(200, 255)))
+        draw = ImageDraw.Draw(img)
+       
+        # Add objects
+        num_objects = random.randint(1, 4)
+        annotations = []
+       
+        for _ in range(num_objects):
+            # Choose random object
+            obj_name = random.choice(list(object_configs.keys()))
+            obj_config = object_configs[obj_name]
+            cls_id = HOME_OBJECTS.index(obj_name) if obj_name in HOME_OBJECTS else 0
+           
+            # Random position and size
+            x_center = random.uniform(0.2, 0.8)
+            y_center = random.uniform(0.2, 0.8)
+            width = random.uniform(0.1, 0.3)
+            height = random.uniform(0.1, 0.3)
+           
+            # Convert to pixel coordinates
+            x1 = int((x_center - width/2) * 416)
+            y1 = int((y_center - height/2) * 416)
+            x2 = int((x_center + width/2) * 416)
+            y2 = int((y_center + height/2) * 416)
+           
+            # Draw object
+            if obj_config['shape'] == 'rect':
+                draw.rectangle([x1, y1, x2, y2], fill=obj_config['color'], outline='black', width=2)
+            else:
+                draw.ellipse([x1, y1, x2, y2], fill=obj_config['color'], outline='black', width=2)
+           
+            # Add label
+            try:
+                font = ImageFont.load_default()
+                draw.text((x1, y1-15), obj_name, fill='black', font=font)
+            except:
+                draw.text((x1, y1-15), obj_name, fill='black')
+           
+            # Save annotation
+            annotations.append(f"{cls_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}")
+       
+        # Save image and annotations
+        img_path = dataset_path / f"sample_{i:04d}.jpg"
+        ann_path = dataset_path / f"sample_{i:04d}.txt"
+       
+        img.save(img_path, 'JPEG', quality=90)
+       
+        with open(ann_path, 'w') as f:
+            f.write('\n'.join(annotations))
+   
+    logger.info(f"Sample dataset created at {dataset_path}")
+    return True
 def main():
-    logger.info("Home Objects Detection Model - YOLO-style Implementation")
-    logger.info("=" * 60)
-    
+    """Main training function"""
+    logger.info("Fast Object Detection Training")
+    logger.info("=" * 50)
+   
     # Configuration
     dataset_dir = "./detection_dataset"
-    batch_size = 8  # Smaller batch size for detection
-    num_epochs = 10
-    learning_rate = 0.001
-    
-    try:
-        # Initialize model
-        model = HomeObjectDetectionModel(num_classes=NUM_CLASSES)
-        total_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Model initialized with {total_params:,} parameters")
-        
-        # Create synthetic dataset if directory empty
-        dataset_path = Path(dataset_dir)
-        if not dataset_path.exists() or len(list(dataset_path.glob('*.jpg'))) == 0:
-            logger.info("Creating synthetic detection dataset...")
-            success = create_synthetic_detection_dataset(dataset_dir, num_images=200)
-            if not success:
-                logger.error("Failed to create synthetic dataset")
-                return
-        
-        # Get transforms
-        train_transform, val_transform = get_detection_transforms()
-        
-        # Load datasets
-        train_dataset = HomeObjectsDetectionDataset(dataset_dir, transform=train_transform)
-        val_dataset = HomeObjectsDetectionDataset(dataset_dir, transform=val_transform)
-        
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, collate_fn=collate_fn)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_fn)
-        
-        logger.info(f"Dataset loaded successfully:")
-        logger.info(f"  Training samples: {len(train_dataset)}")
-        logger.info(f"  Batch size: {batch_size}")
-        
-        # Train model
-        train_losses = train_detection_model(
-            model, train_loader, val_loader, num_epochs, learning_rate
-        )
-        
-        # Save final model
-        model_save_path = Path('home_objects_detection_model.pth')
-        torch.save(model.state_dict(), model_save_path)
-        logger.info(f"Final model saved as '{model_save_path}'")
-        
-        # Also create a copy for API compatibility
-        expected_path = Path('home_objects_cnn.pth')
-        if not expected_path.exists():
-            import shutil
-            shutil.copy(model_save_path, expected_path)
-            logger.info(f"Also saved model as '{expected_path}' for API compatibility")
-        
-        logger.info("Training completed successfully!")
-        
-    except Exception as e:
-        logger.error(f"Error in main execution: {e}")
-        import traceback
-        traceback.print_exc()
-
+    batch_size = 16 # Larger batch for faster training
+    num_epochs = 15 # Reduced epochs
+    learning_rate = 0.002 # Higher learning rate
+   
+    # Create sample dataset if needed
+    dataset_path = Path(dataset_dir)
+    if not dataset_path.exists() or len(list(dataset_path.glob('*.jpg'))) < 10:
+        logger.info("Creating sample dataset...")
+        create_sample_detection_dataset(dataset_dir, num_images=200)
+   
+    # Initialize model
+    model = HomeObjectDetectionModel(num_classes=NUM_CLASSES)
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model initialized with {total_params:,} parameters")
+   
+    # Get transforms and datasets
+    train_transform, val_transform = get_fast_transforms()
+   
+    train_dataset = FastDetectionDataset(dataset_dir, transform=train_transform)
+    val_dataset = FastDetectionDataset(dataset_dir, transform=val_transform)
+   
+    # Data loaders with optimizations
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=4, pin_memory=True, collate_fn=collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=4, pin_memory=True, collate_fn=collate_fn
+    )
+   
+    logger.info(f"Training dataset: {len(train_dataset)} images")
+    logger.info(f"Batch size: {batch_size}")
+    logger.info(f"Training batches: {len(train_loader)}")
+   
+    # Train model
+    best_loss = train_fast_detection_model(
+        model, train_loader, val_loader, num_epochs, learning_rate
+    )
+   
+    logger.info(f"Training completed with best loss: {best_loss:.4f}")
+   
+    # Save additional model formats
+    torch.save(model.state_dict(), 'home_objects_detection_model.pth')
+    torch.save(model.state_dict(), 'home_objects_cnn.pth')
+   
+    logger.info("Model saved in multiple formats for compatibility")
 if __name__ == "__main__":
     main()
