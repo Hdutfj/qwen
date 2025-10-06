@@ -1,13 +1,13 @@
 """
 Enhanced FastAPI Backend for Object Detection
-Optimized for fast inference and better detection accuracy
+Using OpenAI API for object detection
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-import torch
-import torchvision.transforms as transforms
+import requests
+from openai import OpenAI
 from PIL import Image, ImageDraw, ImageFont
 import io
 import numpy as np
@@ -22,29 +22,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import os
 from dotenv import load_dotenv
-import requests
-
-# Import the enhanced object detection model
-from object_detection_model import (
-    HomeObjectDetectionModel, 
-    draw_bounding_boxes, 
-    # HOME_OBJECTS,  # Comment out import; define explicitly below
-    # NUM_CLASSES  # Comment out; define below
-)
-
-# Define HOME_OBJECTS explicitly (COCO 80 classes)
-HOME_OBJECTS = [
-    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
-    'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
-    'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
-    'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
-    'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
-    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
-    'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard',
-    'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase',
-    'scissors', 'teddy bear', 'hair drier', 'toothbrush'
-]
-NUM_CLASSES = len(HOME_OBJECTS)  # 80
+from base64 import b64encode
 
 # Load environment variables from .env file
 load_dotenv()
@@ -53,9 +31,16 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Initialize OpenAI client
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+if not openai_client.api_key:
+    logger.error("OPENAI_API_KEY not found in environment variables")
+    raise ValueError("OPENAI_API_KEY is required")
+
 app = FastAPI(
     title="Enhanced Object Detection API",
-    description="Fast and accurate object detection with 80+ object classes",
+    description="Object detection using OpenAI API",
     version="2.0.0"
 )
 
@@ -75,181 +60,193 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 static_dir = Path("static")
 static_dir.mkdir(exist_ok=True)
 
-# Global model and device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logger.info(f"Using device: {device} ({'GPU' if device.type == 'cuda' else 'CPU'})")
-
-# Initialize model with corrected NUM_CLASSES
-model = HomeObjectDetectionModel(num_classes=NUM_CLASSES)
-
-# Load trained model with fallback options, prioritizing home_objects_detection_model.pth
-model_paths = [
-    "home_objects_detection_model.pth", 
-    "best_detection_model.pth",
-    "home_objects_cnn.pth",
-    "yolov5s.pt"  # Try loading a pre-trained YOLO model as fallback
-]
-
-model_loaded = False
-loaded_key_count = 0
-total_params = len(model.state_dict())
-
-for model_path in model_paths:
-    if Path(model_path).exists():
-        try:
-            logger.info(f"Attempting to load model from {model_path}")
-            checkpoint = torch.load(model_path, map_location=device)
-            
-            state_dict = checkpoint.get('model_state_dict') or checkpoint.get('state_dict') or checkpoint
-            
-            # Load and count matched keys
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            loaded_key_count = total_params - len(missing)
-            logger.info(f"Loaded {loaded_key_count}/{total_params} keys from {model_path} (missing: {len(missing)}, unexpected: {len(unexpected)})")
-            
-            if len(missing) == 0 and len(unexpected) == 0:
-                model_loaded = True
-                logger.info(f"Successfully loaded model from {model_path} with perfect match")
-                break
-            elif loaded_key_count / total_params > 0.8:
-                model_loaded = True
-                logger.warning(f"Partially loaded model from {model_path} ({loaded_key_count}/{total_params} keys matched). May work but verify performance.")
-                break
-            else:
-                logger.warning(f"Too few keys matched ({loaded_key_count}/{total_params}). Skipping.")
-                
-        except Exception as e:
-            logger.warning(f"Failed to load model from {model_path}: {e}")
-
-if not model_loaded:
-    logger.warning("No suitable pre-trained model found. Initializing with defaults and attempting quick training...")
-    try:
-        from object_detection_model import create_sample_detection_dataset, train_fast_detection_model
-        from object_detection_model import FastDetectionDataset, get_fast_transforms, collate_fn
-        from torch.utils.data import DataLoader
-        
-        logger.info("Creating sample dataset...")
-        if create_sample_detection_dataset("temp_dataset", num_images=200):
-            train_transform, _ = get_fast_transforms()
-            dataset = FastDetectionDataset("temp_dataset", transform=train_transform)
-            
-            if len(dataset) > 0:
-                loader = DataLoader(dataset, batch_size=16, shuffle=True, collate_fn=collate_fn, num_workers=2)
-                logger.info("Performing quick training...")
-                train_fast_detection_model(model, loader, loader, num_epochs=10, learning_rate=0.001, save_path='quick_model.pth')
-                model_loaded = True
-                logger.info("Quick training completed")
-    except Exception as e:
-        logger.error(f"Failed to train quick model: {e}. Using un trained model - detection may be poor.")
-
-# Move model to device and set to eval mode
-model.to(device)
-model.eval()
-
-# Optimized image transforms
-transform = transforms.Compose([
-    transforms.Resize((416, 416)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-
 # Thread pool for parallel processing
 executor = ThreadPoolExecutor(max_workers=4)
 
-def process_single_image(image_data, confidence_threshold=0.25):
-    """Process a single image for object detection"""
+def process_single_image_openai(img: Image.Image):
+    """Process a single PIL Image for object detection using OpenAI API"""
     try:
-        img = Image.open(io.BytesIO(image_data)).convert('RGB')
-        original_size = img.size
-        
-        input_tensor = transform(img).unsqueeze(0).to(device)
-        
         start_time = time.time()
-        with torch.no_grad():
-            detections = model.predict(input_tensor, conf_thresh=confidence_threshold)
-        inference_time = time.time() - start_time
         
+        # Convert PIL image to base64 for API request
+        buffer = io.BytesIO()
+        img.save(buffer, format="JPEG", quality=85)
+        img_base64 = b64encode(buffer.getvalue()).decode('utf-8')
+        
+        # Call OpenAI API for image analysis
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",  # Using GPT-4 Omni model which includes vision capabilities
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text", 
+                            "text": "Analyze this image and identify all objects present with their approximate locations. Return a JSON response with the following structure: {\"objects\": [{\"name\": \"object_name\", \"confidence\": 0.95, \"position\": \"position_in_image\", \"size_ratio\": 0.2}]}. Position can be 'top-left', 'top-center', 'top-right', 'middle-left', 'center', 'middle-right', 'bottom-left', 'bottom-center', 'bottom-right'. Size_ratio represents approximate space the object occupies (0.0 to 1.0). Common objects to look for include: chair, table, sofa, bed, desk, lamp, mirror, window, door, curtain, bookshelf, TV, refrigerator, microwave, stove, sink, toilet, bathtub, shower, towel, pillow, painting, plant, cup, bottle, and any other common household items. Only respond with the JSON object and nothing else."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=500,
+            temperature=0.1  # Lower temperature for more consistent results
+        )
+        
+        # Extract the response
+        result_text = response.choices[0].message.content
+        logger.info(f"OpenAI response: {result_text}")
+        
+        import json
+        try:
+            # Try to parse the JSON response
+            result = json.loads(result_text)
+            detected_objects = result.get("objects", [])
+        except json.JSONDecodeError:
+            # If the response wasn't valid JSON, try to extract object list from text
+            detected_objects = []
+            # Try to handle various response formats
+            import re
+            # Look for JSON-like structures in the response
+            json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+            if json_match:
+                try:
+                    partial_result = json.loads(json_match.group())
+                    detected_objects = partial_result.get("objects", [])
+                except json.JSONDecodeError:
+                    # If still can't parse, try simpler approach
+                    # Look for items in a list format like item1, item2, item3
+                    detected_objects = [obj.strip().strip('"\'') for obj in result_text.split(',') if obj.strip()]
+            else:
+                # If no JSON found, just return the text as a single object
+                detected_objects = [{"name": result_text.strip(), "confidence": 0.5}]
+        
+        # Format as detection results (without bounding boxes since OpenAI doesn't provide them)
         detection_results = []
-        for det in detections[0]:
-            x_center, y_center, width, height, conf, cls_id = det
+        for obj in detected_objects:
+            if isinstance(obj, dict):
+                # If obj is a dictionary with name, confidence, position, and size_ratio
+                class_name = obj.get("name", "")
+                confidence = obj.get("confidence", 0.85)
+                position = obj.get("position", "unknown")
+                size_ratio = obj.get("size_ratio", 0.1)
+            else:
+                # If obj is just a string
+                class_name = str(obj)
+                confidence = 0.85  # Default confidence
+                position = "unknown"
+                size_ratio = 0.1  # Default size ratio
             
-            x1 = int((x_center - width/2) * original_size[0])
-            y1 = int((y_center - height/2) * original_size[1])
-            x2 = int((x_center + width/2) * original_size[0])
-            y2 = int((y_center + height/2) * original_size[1])
-            
-            x1 = max(0, min(x1, original_size[0]))
-            y1 = max(0, min(y1, original_size[1]))
-            x2 = max(0, min(x2, original_size[0]))
-            y2 = max(0, min(y2, original_size[1]))
-            
-            if x2 > x1 and y2 > y1:
-                class_name = HOME_OBJECTS[int(cls_id)] if int(cls_id) < len(HOME_OBJECTS) else f"class_{int(cls_id)}"
+            if class_name and class_name.strip():  # Make sure the object name isn't empty
                 detection_results.append({
                     "class": class_name,
-                    "confidence": float(conf),
-                    "bbox": [x1, y1, x2, y2],
-                    "center": [float(x_center), float(y_center)],
-                    "size": [float(width), float(height)],
-                    "image_width": original_size[0],
-                    "image_height": original_size[1]
+                    "confidence": confidence,
+                    "position": position,
+                    "size_ratio": size_ratio,
+                    "bbox": None,  # OpenAI API doesn't provide bounding boxes in this usage
+                    "center": None,
+                    "size": None,
+                    "image_width": img.width,
+                    "image_height": img.height
                 })
         
-        result_img = draw_bounding_boxes(img, detections[0]) if len(detections[0]) > 0 else img
+        inference_time = time.time() - start_time
         
         return {
             "success": True,
             "detections": detection_results,
-            "result_image": result_img,
+            "result_image": img,  # Return original image since we can't draw bounding boxes
             "inference_time": inference_time,
-            "image_size": original_size
+            "image_size": (img.width, img.height)
         }
         
     except Exception as e:
-        logger.error(f"Error processing image: {e}")
+        logger.error(f"Error processing image with OpenAI API: {e}")
         return {"success": False, "error": str(e)}
 
 def draw_local_bounding_boxes(image, detections):
+    """Draw bounding boxes and labels on image based on detections - using position info from OpenAI when available"""
     if not detections:
         return image
     
-    draw = ImageDraw.Draw(image)
+    # Work with a copy of the image
+    result_image = image.copy()
+    draw = ImageDraw.Draw(result_image)
     
+    # Define position mapping to coordinates
+    width, height = image.size
+    position_coords = {
+        "top-left": (width * 0.2, height * 0.2),
+        "top-center": (width * 0.5, height * 0.2),
+        "top-right": (width * 0.8, height * 0.2),
+        "middle-left": (width * 0.2, height * 0.5),
+        "center": (width * 0.5, height * 0.5),
+        "middle-right": (width * 0.8, height * 0.5),
+        "bottom-left": (width * 0.2, height * 0.8),
+        "bottom-center": (width * 0.5, height * 0.8),
+        "bottom-right": (width * 0.8, height * 0.8)
+    }
+    
+    # Define a color palette for different objects
     colors = [
         '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7',
         '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E9',
         '#F8C471', '#82E0AA', '#F1948A', '#85C1E9', '#D7BDE2'
-    ] * 10
+    ]
     
     for i, det in enumerate(detections):
-        x1, y1, x2, y2 = det['bbox']
-        color = colors[i % len(colors)]
-        class_name = det['class']
-        confidence = det['confidence']
+        # Get position info from detection if available
+        position_str = det.get("position", "unknown")
+        size_ratio = det.get("size_ratio", 0.1)
         
+        if position_str in position_coords:
+            x, y = position_coords[position_str]
+        else:
+            # Fallback to grid if position not provided
+            grid_rows = int(len(detections) ** 0.5) + 1
+            grid_cols = grid_rows
+            row = i // grid_cols
+            col = i % grid_cols
+            x = (col + 1) * width // (grid_cols + 1)
+            y = (row + 1) * height // (grid_rows + 1)
+        
+        # Get color for this object
+        color = colors[i % len(colors)]
+        class_name = det.get("class", "Unknown")
+        
+        # Calculate box size based on size_ratio
+        box_size = int(60 + (size_ratio * 100))  # Base size of 60 + adjustment for size ratio
+        x1, y1 = x - box_size//2, y - box_size//2
+        x2, y2 = x + box_size//2, y + box_size//2
+        
+        # Draw rectangle
         for thickness in range(3):
             draw.rectangle([x1-thickness, y1-thickness, x2+thickness, y2+thickness], 
                            outline=color, width=1)
         
-        label = f"{class_name}: {confidence:.2f}"
+        # Draw label with background
         try:
             font = ImageFont.load_default()
         except:
             font = None
 
         if font:
-            bbox = draw.textbbox((0, 0), label, font=font)
+            bbox = draw.textbbox((0, 0), class_name, font=font)
             text_width = bbox[2] - bbox[0]
             text_height = bbox[3] - bbox[1]
         else:
-            text_width, text_height = len(label) * 6, 11
+            text_width, text_height = len(class_name) * 6, 11
 
         label_y = max(0, y1 - text_height - 5)
         draw.rectangle([x1, label_y, x1 + text_width + 10, label_y + text_height + 5], 
                        fill=color)
-        draw.text((x1 + 5, label_y + 2), label, fill='white', font=font)
+        draw.text((x1 + 5, label_y + 2), class_name, fill='white', font=font)
     
-    return image
+    return result_image
 
 @app.get("/")
 def read_root():
@@ -257,10 +254,10 @@ def read_root():
         "message": "Enhanced Object Detection API",
         "version": "2.0.0",
         "features": [
-            "80+ object classes",
+            "Bathroom object detection",
             "Fast inference",
             "High accuracy detection",
-            "Batch processing support"
+            "Single and batch processing support"
         ],
         "endpoints": {
             "/detect": "Single image detection",
@@ -274,65 +271,94 @@ def read_root():
 
 @app.post("/detect")
 async def detect_objects(
-    image: UploadFile = File(...), 
-    confidence_threshold: float = Form(0.25),
+    request: Request,
+    image: Optional[UploadFile] = File(None),
+    # Remove confidence_threshold since OpenAI doesn't use it
     draw_boxes: bool = Form(True)
 ):
+    """
+    Detect objects in an uploaded image using OpenAI API.
+    Handles both file uploads and raw binary image input.
+    """
+    # Pre-read request body if image is None to avoid "Stream consumed" error in exception handling
+    if image is None:
+        try:
+            contents = await request.body()
+            if not contents:
+                raise HTTPException(status_code=400, detail="No image data received.")
+            image_name = f"raw_upload_{uuid.uuid4().hex}.jpg"
+        except Exception as e:
+            logger.error(f"Error reading request body in detect endpoint: {e}")
+            raise HTTPException(status_code=400, detail="Failed to read image data from request body.")
+    else:
+        if not image.content_type or not image.content_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
+        
+        # Read file bytes ONCE and store them in memory
+        try:
+            contents = await image.read()
+            image_name = image.filename
+        except Exception as e:
+            logger.error(f"Error reading uploaded file in detect endpoint: {e}")
+            raise HTTPException(status_code=400, detail="Failed to read uploaded image file.")
+
     try:
-        if not image.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="File must be an image")
-        
-        contents = await image.read()
-        
-        detection_source = "local_model"
-        result = process_single_image(contents, confidence_threshold)
-        
+        # Convert bytes → image once
+        try:
+            img = Image.open(io.BytesIO(contents)).convert("RGB")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image file or corrupted data.")
+
+        # Run model prediction with the PIL Image using OpenAI API
+        result = process_single_image_openai(img)
         if not result["success"]:
             raise HTTPException(status_code=500, detail=result["error"])
-        
+
         detections = result["detections"]
-        result_image = None
-        
+
+        # --- Draw bounding boxes ---
         if draw_boxes:
-            img = Image.open(io.BytesIO(contents)).convert('RGB')
-            temp_detections = [
-                {"class": det["class"], "confidence": det["confidence"], "bbox": det["bbox"]}
-                for det in detections
-            ]
-            result_image = draw_local_bounding_boxes(img, temp_detections)
-        
+            result_image = draw_local_bounding_boxes(img.copy(), detections)
+        else:
+            result_image = img
+
+        # Save final image
         result_url = None
         if result_image:
+            static_dir.mkdir(exist_ok=True)
             unique_id = str(uuid.uuid4())
-            result_path = static_dir / f"result_{detection_source}_{unique_id}.jpg"
+            result_path = static_dir / f"result_{unique_id}.jpg"
             result_image.save(result_path, "JPEG", quality=95)
-            result_url = f"/static/result_{detection_source}_{unique_id}.jpg"
+            result_url = f"/static/result_{unique_id}.jpg"
+
+        # Extract unique object names from detections
+        detected_objects = list(set(det["class"] for det in detections))
         
-        response_data = {
-            "filename": image.filename,
+        return {
+            "filename": image_name,
             "detections": detections,
             "detection_count": len(detections),
-            "result_image_url": result_url if result_image else None,
-            "confidence_threshold": confidence_threshold,
-            "detection_source": detection_source,
+            "detected_objects": detected_objects,  # List of unique objects found
+            "result_image_url": result_url,
             "inference_time_ms": round(result["inference_time"] * 1000, 2),
             "image_size": result["image_size"]
         }
-        
-        return response_data
-        
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error in detect endpoint: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log the original exception - we don't access request here to avoid stream consumption issues
+        logger.error(f"Error in detect endpoint after reading image data: {type(e).__name__} - {e}")
+        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
 
 @app.post("/detect-batch")
 async def detect_objects_batch(
     images: List[UploadFile] = File(...),
-    confidence_threshold: float = Form(0.25),
     draw_boxes: bool = Form(True)
 ):
+    if not images:
+        raise HTTPException(status_code=400, detail="At least one image file is required")
+    
     if len(images) > 20:
         raise HTTPException(status_code=400, detail="Maximum 20 images per batch")
     
@@ -342,39 +368,48 @@ async def detect_objects_batch(
         
         for image in images:
             if not image.content_type.startswith('image/'):
+                logger.warning(f"Skipping {image.filename}: Invalid content type {image.content_type}")
                 continue
             
             contents = await image.read()
-            detection_source = "local_model"
-            result = process_single_image(contents, confidence_threshold)
+            try:
+                img = Image.open(io.BytesIO(contents)).convert('RGB')
+            except Exception:
+                logger.warning(f"Failed to open {image.filename}: Invalid image file")
+                continue
+                
+            result = process_single_image_openai(img)
             
             if not result["success"]:
+                logger.warning(f"Failed to process {image.filename}: {result['error']}")
                 continue
             
             detections = result["detections"]
             result_image = None
             
             if draw_boxes:
-                img = Image.open(io.BytesIO(contents)).convert('RGB')
                 temp_detections = [
                     {"class": det["class"], "confidence": det["confidence"], "bbox": det["bbox"]}
                     for det in detections
                 ]
-                result_image = draw_local_bounding_boxes(img, temp_detections)
+                result_image = draw_local_bounding_boxes(img.copy(), temp_detections)
             
             result_url = None
             if result_image:
                 unique_id = str(uuid.uuid4())
-                result_path = static_dir / f"batch_{detection_source}_{unique_id}.jpg"
+                result_path = static_dir / f"batch_openai_{unique_id}.jpg"
                 result_image.save(result_path, "JPEG", quality=95)
-                result_url = f"/static/batch_{detection_source}_{unique_id}.jpg"
+                result_url = f"/static/batch_openai_{unique_id}.jpg"
+            
+            detected_objects = list(set(det["class"] for det in detections))
             
             result_item = {
                 "filename": image.filename,
                 "detections": detections,
+                "detected_objects": detected_objects,
                 "detection_count": len(detections),
                 "result_image_url": result_url,
-                "detection_source": detection_source,
+                "detection_source": "openai",
                 "inference_time_ms": round(result["inference_time"] * 1000, 2),
                 "image_size": result["image_size"]
             }
@@ -382,10 +417,12 @@ async def detect_objects_batch(
             results.append(result_item)
             total_detections += len(detections)
         
+        if not results:
+            raise HTTPException(status_code=400, detail="No valid images processed")
+        
         return {
             "batch_size": len(results),
             "total_detections": total_detections,
-            "confidence_threshold": confidence_threshold,
             "results": results
         }
         
@@ -396,7 +433,6 @@ async def detect_objects_batch(
 @app.get("/detect-url")
 async def detect_from_url(
     image_url: str,
-    confidence_threshold: float = 0.25,
     draw_boxes: bool = True
 ):
     try:
@@ -407,8 +443,12 @@ async def detect_from_url(
             raise HTTPException(status_code=400, detail="URL does not point to an image")
         
         contents = response.content
-        detection_source = "local_model"
-        result = process_single_image(contents, confidence_threshold)
+        try:
+            img = Image.open(io.BytesIO(contents)).convert('RGB')
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image file from URL")
+        
+        result = process_single_image_openai(img)
         
         if not result["success"]:
             raise HTTPException(status_code=500, detail=result["error"])
@@ -417,26 +457,28 @@ async def detect_from_url(
         result_image = None
         
         if draw_boxes:
-            img = Image.open(io.BytesIO(contents)).convert('RGB')
             temp_detections = [
                 {"class": det["class"], "confidence": det["confidence"], "bbox": det["bbox"]}
                 for det in detections
             ]
-            result_image = draw_local_bounding_boxes(img, temp_detections)
+            result_image = draw_local_bounding_boxes(img.copy(), temp_detections)
         
         result_url = None
         if result_image:
             unique_id = str(uuid.uuid4())
-            result_path = static_dir / f"url_{detection_source}_{unique_id}.jpg"
+            result_path = static_dir / f"url_openai_{unique_id}.jpg"
             result_image.save(result_path, "JPEG", quality=95)
-            result_url = f"/static/url_{detection_source}_{unique_id}.jpg"
+            result_url = f"/static/url_openai_{unique_id}.jpg"
+        
+        detected_objects = list(set(det["class"] for det in detections))
         
         response_data = {
             "source_url": image_url,
             "detections": detections,
+            "detected_objects": detected_objects,
             "detection_count": len(detections),
             "result_image_url": result_url,
-            "detection_source": detection_source,
+            "detection_source": "openai",
             "inference_time_ms": round(result["inference_time"] * 1000, 2),
             "image_size": result["image_size"]
         }
@@ -452,54 +494,53 @@ async def detect_from_url(
 @app.get("/classes")
 def get_classes():
     return {
-        "classes": HOME_OBJECTS,
-        "total_classes": len(HOME_OBJECTS),
-        "categories": {
-            "people_animals": HOME_OBJECTS[:24],
-            "vehicles": HOME_OBJECTS[1:9],
-            "household_items": HOME_OBJECTS[40:],
-            "electronics": [cls for cls in HOME_OBJECTS if cls in ['tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone']]
-        }
+        "service": "OpenAI Vision API",
+        "description": "Using OpenAI's GPT-4 Vision model for general object detection",
+        "capabilities": [
+            "General object recognition",
+            "Scene understanding",
+            "Text in images",
+            "Color detection",
+            "Shape identification"
+        ]
     }
 
 @app.get("/health")
 def health_check():
     try:
-        dummy_input = torch.randn(1, 3, 416, 416).to(device)
-        with torch.no_grad():
-            start_time = time.time()
-            _ = model(dummy_input)
-            inference_time = time.time() - start_time
+        # Test OpenAI API connection
+        start_time = time.time()
+        
+        # Create a dummy 1x1 pixel image for testing
+        dummy_img = Image.new('RGB', (10, 10), color='white')
+        result = process_single_image_openai(dummy_img)
+        
+        inference_time = time.time() - start_time
         
         return {
             "status": "healthy",
-            "model_loaded": model_loaded,
-            "device": str(device),
-            "model_parameters": sum(p.numel() for p in model.parameters()),
+            "openai_api_key_set": bool(openai_client.api_key),
             "inference_test_ms": round(inference_time * 1000, 2),
-            "supported_classes": len(HOME_OBJECTS),
             "api_version": "2.0.0"
         }
     except Exception as e:
         return {
             "status": "unhealthy",
             "error": str(e),
-            "model_loaded": model_loaded
+            "openai_api_key_set": bool(openai_client.api_key)
         }
 
 @app.get("/stats")
 def get_stats():
     return {
         "model_info": {
-            "architecture": "Fast YOLO",
-            "input_size": "416x416",
-            "output_grid": "13x13",
-            "anchors": 3,
-            "classes": len(HOME_OBJECTS)
+            "service": "OpenAI GPT-4 Vision",
+            "api_provider": "OpenAI",
+            "detection_method": "Cloud-based image analysis"
         },
         "performance": {
-            "device": str(device),
-            "mixed_precision": device.type == 'cuda',
+            "api_based": True,
+            "network_required": True,
             "batch_processing": True,
             "parallel_inference": True
         },
@@ -507,8 +548,8 @@ def get_stats():
             "real_time_detection": True,
             "batch_processing": True,
             "url_detection": True,
-            "confidence_filtering": True,
-            "nms_filtering": True
+            "object_recognition": True,
+            "detailed_analysis": True
         }
     }
 
@@ -524,45 +565,41 @@ def test_detection():
         
         try:
             font = ImageFont.load_default()
-            draw.text((100, 80), "chair", fill='black', font=font)
-            draw.text((250, 130), "clock", fill='black', font=font)
-            draw.text((50, 280), "book", fill='black', font=font)
+            draw.text((100, 80), "toilet", fill='black', font=font)
+            draw.text((250, 130), "sink", fill='black', font=font)
+            draw.text((50, 280), "mirror", fill='black', font=font)
         except:
             pass
         
-        img_bytes = io.BytesIO()
-        test_img.save(img_bytes, format='JPEG')
-        img_bytes.seek(0)
-        
-        contents = img_bytes.getvalue()
-        detection_source = "local_model"
-        result = process_single_image(contents, 0.1)
+        result = process_single_image_openai(test_img)
         
         detections = result["detections"] if result["success"] else []
         
         result_image = None
         if result["success"]:
-            img = Image.open(io.BytesIO(contents)).convert('RGB')
             temp_detections = [
                 {"class": det["class"], "confidence": det["confidence"], "bbox": det["bbox"]}
                 for det in detections
             ]
-            result_image = draw_local_bounding_boxes(img, temp_detections)
+            result_image = draw_local_bounding_boxes(test_img.copy(), temp_detections)
         
         unique_id = str(uuid.uuid4())
-        result_path = static_dir / f"test_{detection_source}_{unique_id}.jpg"
+        result_path = static_dir / f"test_openai_{unique_id}.jpg"
         if result_image:
             result_image.save(result_path, "JPEG", quality=95)
-            result_url = f"/static/test_{detection_source}_{unique_id}.jpg"
+            result_url = f"/static/test_openai_{unique_id}.jpg"
         else:
             result_url = None
+        
+        detected_objects = list(set(det["class"] for det in detections))
         
         return {
             "test_status": "success" if result["success"] else "failed",
             "detections_found": len(detections),
+            "detected_objects": detected_objects,
             "detections": detections,
             "test_image_url": result_url,
-            "detection_source": detection_source
+            "detection_source": "openai"
         }
             
     except Exception as e:
@@ -573,9 +610,7 @@ def test_detection():
         }
 
 if __name__ == "__main__":
-    logger.info("Starting Enhanced Object Detection API Server")
-    logger.info(f"Model classes: {len(HOME_OBJECTS)}")
-    logger.info(f"Device: {device}")
+    logger.info("Starting Enhanced Object Detection API Server using OpenAI API")
     
     uvicorn.run(
         "api_server:app",
