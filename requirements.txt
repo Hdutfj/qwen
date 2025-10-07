@@ -13,3 +13,5 @@ scikit-learn>=1.0.0
 transformers>=4.20.0
 transformers[torch]
 opencv-python>=4.5.0
+trimesh>=3.21.0
+pygltflib>=1.16.2

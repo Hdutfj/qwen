@@ -13,6 +13,15 @@ from dataclasses import dataclass
 from pathlib import Path
 import logging
 
+# Handle 3D libraries import
+try:
+    import trimesh
+    from pygltflib import GLTF2, Scene, Node, Mesh, Primitive, Buffer, BufferView, Accessor, Asset, Material, PBRMetallicRoughness
+    TRIMESH_AVAILABLE = True
+except ImportError:
+    TRIMESH_AVAILABLE = False
+    print("Warning: trimesh or pygltflib library not available. 3D file generation will use dummy implementation.")
+
 # Handle transformers import gracefully
 try:
     from transformers import pipeline, AutoFeatureExtractor
@@ -423,6 +432,144 @@ class Scene3DVisualizer:
         }
         return color_map.get(class_name, '#95A5A6')  # Default gray color
 
+    def generate_glb_file(self, objects_3d: List[Object3DInfo], output_path: str):
+        """
+        Generate a GLB file containing 3D objects based on detections
+        """
+        if not TRIMESH_AVAILABLE:
+            logger.warning("Trimesh or pygltflib not available - skipping GLB generation")
+            return None
+
+        try:
+            # Create a scene with all objects
+            scene = trimesh.Scene()
+            
+            # Add each object to the scene
+            for i, obj in enumerate(objects_3d):
+                # Determine the shape based on the object class
+                class_name = obj.class_name.lower()
+                
+                # Scale from meters to a more appropriate 3D scale
+                position = obj.center_3d  # [x, y, z]
+                dimensions = obj.dimensions_3d  # [width, height, depth]
+                
+                # Create a basic shape based on the object class
+                if 'sink' in class_name or 'bathtub' in class_name or 'toilet' in class_name:
+                    # Create a box shape for rectangular objects
+                    mesh = trimesh.creation.box(extents=dimensions)
+                elif 'towel' in class_name or 'mirror' in class_name:
+                    # Create a flat rectangular shape for flat objects
+                    extents = [max(dimensions[0], 0.1), max(dimensions[1], 0.1), max(dimensions[2], 0.01)]
+                    mesh = trimesh.creation.box(extents=extents)
+                elif 'bottle' in class_name or 'toothbrush' in class_name:
+                    # Create a cylinder for bottle-shaped objects
+                    radius = min(dimensions[0], dimensions[1]) / 2
+                    height = dimensions[2]
+                    mesh = trimesh.creation.cylinder(radius=radius or 0.1, height=height or 0.3)
+                elif 'showerhead' in class_name or 'toilet_paper' in class_name:
+                    # Create a sphere for round objects
+                    radius = min(dimensions) / 2
+                    mesh = trimesh.creation.icosphere(subdivisions=2, radius=radius or 0.1)
+                else:
+                    # Default: box shape
+                    extents = [max(d, 0.05) for d in dimensions]  # Ensure minimum size
+                    mesh = trimesh.creation.box(extents=extents)
+                
+                # Transform the mesh to the correct position
+                translation_matrix = trimesh.transformations.translation_matrix(position)
+                mesh.apply_transform(translation_matrix)
+                
+                # Use the class-specific color
+                color = self._get_color_for_class(obj.class_name)
+                # Convert hex color to RGB (0-255)
+                if color.startswith('#'):
+                    color = color[1:]  # Remove '#'
+                    r = int(color[0:2], 16)
+                    g = int(color[2:4], 16)
+                    b = int(color[4:6], 16)
+                    mesh.visual.face_colors = [r, g, b, 200]  # RGBA with some transparency
+                
+                # Add to scene
+                scene.add_geometry(mesh, node_name=f"{obj.class_name}_{i}")
+            
+            # Export the scene as GLB
+            scene.export(output_path, file_type='glb')
+            logger.info(f"GLB file saved to {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Error generating GLB file: {e}")
+            return None
+
+    def generate_gltf_file(self, objects_3d: List[Object3DInfo], output_path: str):
+        """
+        Generate a GLTF file containing 3D objects based on detections
+        """
+        if not TRIMESH_AVAILABLE:
+            logger.warning("Trimesh or pygltflib not available - skipping GLTF generation")
+            return None
+
+        try:
+            # Create a scene with all objects
+            scene = trimesh.Scene()
+            
+            # Add each object to the scene
+            for i, obj in enumerate(objects_3d):
+                # Determine the shape based on the object class
+                class_name = obj.class_name.lower()
+                
+                # Scale from meters to a more appropriate 3D scale
+                position = obj.center_3d  # [x, y, z]
+                dimensions = obj.dimensions_3d  # [width, height, depth]
+                
+                # Create a basic shape based on the object class
+                if 'sink' in class_name or 'bathtub' in class_name or 'toilet' in class_name:
+                    # Create a box shape for rectangular objects
+                    mesh = trimesh.creation.box(extents=dimensions)
+                elif 'towel' in class_name or 'mirror' in class_name:
+                    # Create a flat rectangular shape for flat objects
+                    extents = [max(dimensions[0], 0.1), max(dimensions[1], 0.1), max(dimensions[2], 0.01)]
+                    mesh = trimesh.creation.box(extents=extents)
+                elif 'bottle' in class_name or 'toothbrush' in class_name:
+                    # Create a cylinder for bottle-shaped objects
+                    radius = min(dimensions[0], dimensions[1]) / 2
+                    height = dimensions[2]
+                    mesh = trimesh.creation.cylinder(radius=radius or 0.1, height=height or 0.3)
+                elif 'showerhead' in class_name or 'toilet_paper' in class_name:
+                    # Create a sphere for round objects
+                    radius = min(dimensions) / 2
+                    mesh = trimesh.creation.icosphere(subdivisions=2, radius=radius or 0.1)
+                else:
+                    # Default: box shape
+                    extents = [max(d, 0.05) for d in dimensions]  # Ensure minimum size
+                    mesh = trimesh.creation.box(extents=extents)
+                
+                # Transform the mesh to the correct position
+                translation_matrix = trimesh.transformations.translation_matrix(position)
+                mesh.apply_transform(translation_matrix)
+                
+                # Use the class-specific color
+                color = self._get_color_for_class(obj.class_name)
+                # Convert hex color to RGB (0-255)
+                if color.startswith('#'):
+                    color = color[1:]  # Remove '#'
+                    r = int(color[0:2], 16)
+                    g = int(color[2:4], 16)
+                    b = int(color[4:6], 16)
+                    mesh.visual.face_colors = [r, g, b, 200]  # RGBA with some transparency
+                
+                # Add to scene
+                scene.add_geometry(mesh, node_name=f"{obj.class_name}_{i}")
+            
+            # Export the scene as GLTF
+            scene.export(output_path, file_type='gltf')
+            logger.info(f"GLTF file saved to {output_path}")
+            return output_path
+            
+        except Exception as e:
+            logger.error(f"Error generating GLTF file: {e}")
+            return None
+
 
 class AI3DSceneMapper:
     """Main class that integrates all components of the 3D scene mapper"""
@@ -453,9 +600,19 @@ class AI3DSceneMapper:
         
         # Create 3D visualization
         vis_path = None
+        glb_path = None
+        gltf_path = None
         if output_path:
             vis_path = f"{output_path}_3d_visualization.png"
             self.visualizer.visualize_3d_scene(objects_3d, vis_path)
+            
+            # Generate GLB file
+            glb_path = f"{output_path}.glb"
+            self.visualizer.generate_glb_file(objects_3d, glb_path)
+            
+            # Generate GLTF file
+            gltf_path = f"{output_path}.gltf"
+            self.visualizer.generate_gltf_file(objects_3d, gltf_path)
         
         # Generate 3D scene data for web visualization
         scene_data = self.visualizer.generate_3d_scene_data(objects_3d)
@@ -474,6 +631,8 @@ class AI3DSceneMapper:
             ],
             "scene_data": scene_data,  # For web-based 3D visualization
             "visualization_path": vis_path,
+            "glb_path": glb_path,
+            "gltf_path": gltf_path,
             "object_count": len(objects_3d),
             "success": True
         }

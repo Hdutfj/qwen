@@ -383,7 +383,7 @@ def draw_local_bounding_boxes(image, detections, draw_external_labels=True, outp
         # Check if we have actual bounding box coordinates
         bbox = det.get("bbox", None)
         
-        if bbox and len(bbox) == 4:
+        if bbox is not None and len(bbox) == 4:
             # We have actual coordinates from detection
             x1, y1, x2, y2 = bbox
             # Ensure coordinates are within original image bounds
