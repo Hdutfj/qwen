@@ -170,34 +170,54 @@ def process_single_image_openai(img: Image.Image):
                     pos_height = position_data["height"]
                     
                     # Convert normalized coordinates to pixel coordinates
-                    x1 = int(pos_x * img.width)
-                    y1 = int(pos_y * img.height)
-                    box_width = int(pos_width * img.width)
-                    box_height = int(pos_height * img.height)
-                    x2 = x1 + box_width
-                    y2 = y1 + box_height
-                    
-                    # Calculate center and size
-                    center_x = (x1 + x2) / 2
-                    center_y = (y1 + y2) / 2
-                    size_w = x2 - x1
-                    size_h = y2 - y1
-                    
-                    # Calculate area percentage
-                    object_area = size_w * size_h
-                    total_area = img.width * img.height
-                    area_percentage = (object_area / total_area) * 100 if total_area > 0 else 0
-                    
-                    detection_results.append({
-                        "class": class_name,
-                        "confidence": confidence,
-                        "bbox": [x1, y1, x2, y2],  # Bounding box in pixel coordinates
-                        "center": [center_x, center_y],
-                        "size": [size_w, size_h],
-                        "area_percentage": area_percentage,
-                        "image_width": img.width,
-                        "image_height": img.height
-                    })
+                    try:
+                        x1 = int(pos_x * img.width)
+                        y1 = int(pos_y * img.height)
+                        box_width = int(pos_width * img.width)
+                        box_height = int(pos_height * img.height)
+                        x2 = x1 + box_width
+                        y2 = y1 + box_height
+                        
+                        # Ensure coordinates are within image bounds
+                        x1 = max(0, min(x1, img.width))
+                        y1 = max(0, min(y1, img.height))
+                        x2 = max(0, min(x2, img.width))
+                        y2 = max(0, min(y2, img.height))
+                        
+                        # Calculate center and size
+                        center_x = (x1 + x2) / 2
+                        center_y = (y1 + y2) / 2
+                        size_w = x2 - x1
+                        size_h = y2 - y1
+                        
+                        # Calculate area percentage
+                        object_area = size_w * size_h
+                        total_area = img.width * img.height
+                        area_percentage = (object_area / total_area) * 100 if total_area > 0 else 0
+                        
+                        detection_results.append({
+                            "class": class_name,
+                            "confidence": confidence,
+                            "bbox": [x1, y1, x2, y2],  # Bounding box in pixel coordinates
+                            "center": [center_x, center_y],
+                            "size": [size_w, size_h],
+                            "area_percentage": area_percentage,
+                            "image_width": img.width,
+                            "image_height": img.height
+                        })
+                    except Exception as coord_error:
+                        logger.error(f"Error processing coordinates: {coord_error}")
+                        # Fallback if coordinate processing fails
+                        detection_results.append({
+                            "class": class_name,
+                            "confidence": confidence,
+                            "bbox": None,
+                            "center": None,
+                            "size": None,
+                            "area_percentage": None,
+                            "image_width": img.width,
+                            "image_height": img.height
+                        })
                 else:
                     # Fallback if no detailed position data
                     detection_results.append({
@@ -677,7 +697,8 @@ async def detect_objects(
 @app.post("/detect-batch")
 async def detect_objects_batch(
     images: List[UploadFile] = File(...),
-    draw_boxes: bool = Form(True)
+    draw_boxes: bool = Form(True),
+    detection_method: str = Form("auto")  # Add method selection to batch endpoint too
 ):
     if not images:
         raise HTTPException(status_code=400, detail="At least one image file is required")
@@ -700,8 +721,34 @@ async def detect_objects_batch(
             except Exception:
                 logger.warning(f"Failed to open {image.filename}: Invalid image file")
                 continue
-                
-            result = process_single_image_openai(img)
+            
+            # Determine which detection method to use
+            if detection_method == "auto":
+                # Use OpenAI if available, otherwise use enhanced model
+                if openai_client.api_key:
+                    result = process_single_image_openai(img)
+                    detection_source = "openai"
+                elif enhanced_model:
+                    result = process_single_image_enhanced(img)
+                    detection_source = "enhanced_local"
+                else:
+                    logger.error(f"No detection models available for {image.filename}")
+                    continue
+            elif detection_method == "openai":
+                if not openai_client.api_key:
+                    logger.error(f"OpenAI API key not configured for {image.filename}")
+                    continue
+                result = process_single_image_openai(img)
+                detection_source = "openai"
+            elif detection_method == "enhanced":
+                if not enhanced_model:
+                    logger.error(f"Enhanced model not available for {image.filename}")
+                    continue
+                result = process_single_image_enhanced(img)
+                detection_source = "enhanced_local"
+            else:
+                logger.error(f"Invalid detection method for {image.filename}")
+                continue
             
             if not result["success"]:
                 logger.warning(f"Failed to process {image.filename}: {result['error']}")
@@ -715,14 +762,18 @@ async def detect_objects_batch(
                     {"class": det["class"], "confidence": det["confidence"], "bbox": det["bbox"]}
                     for det in detections
                 ]
-                result_image = draw_local_bounding_boxes(img.copy(), temp_detections)
+                # Choose drawing method based on detection source
+                if detection_source == "enhanced_local":
+                    result_image = draw_local_bounding_boxes(img.copy(), temp_detections)
+                else:
+                    result_image = draw_local_bounding_boxes(img.copy(), temp_detections)
             
             result_url = None
             if result_image:
                 unique_id = str(uuid.uuid4())
-                result_path = static_dir / f"batch_openai_{unique_id}.jpg"
+                result_path = static_dir / f"batch_{detection_source}_{unique_id}.jpg"
                 result_image.save(result_path, "JPEG", quality=100, optimize=True, subsampling=0)
-                result_url = f"/static/batch_openai_{unique_id}.jpg"
+                result_url = f"/static/batch_{detection_source}_{unique_id}.jpg"
             
             detected_objects = list(set(det["class"] for det in detections))
             
@@ -732,7 +783,7 @@ async def detect_objects_batch(
                 "detected_objects": detected_objects,
                 "detection_count": len(detections),
                 "result_image_url": result_url,
-                "detection_source": "openai",
+                "detection_source": detection_source,
                 "inference_time_ms": round(result["inference_time"] * 1000, 2),
                 "image_size": result["image_size"]
             }
