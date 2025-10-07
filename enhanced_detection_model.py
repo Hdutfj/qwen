@@ -588,7 +588,7 @@ class HomeObjectDetectionModel(nn.Module):
         """Get statistics about collected user feedback"""
         return self.feedback_memory.get_feedback_stats()
 
-def draw_bounding_boxes(image, detections, class_names=EXTENDED_CLASSES):
+def draw_bounding_boxes(image, detections, class_names=EXTENDED_CLASSES, output_quality=95):
     """Enhanced bounding box drawing with relationship visualization"""
     if isinstance(image, torch.Tensor):
         # Convert tensor to PIL
@@ -641,8 +641,8 @@ def draw_bounding_boxes(image, detections, class_names=EXTENDED_CLASSES):
         color = colors[int(cls_id) % len(colors)]
         class_name = class_names[int(cls_id)] if int(cls_id) < len(class_names) else f"class_{int(cls_id)}"
 
-        # Draw thick bounding box
-        for thickness in range(3):
+        # Draw thick bounding box with improved rendering
+        for thickness in range(1, 4):
             draw.rectangle([x1-thickness, y1-thickness, x2+thickness, y2+thickness],
                          outline=color, width=1)
 
@@ -1047,7 +1047,7 @@ def create_sample_detection_dataset(dataset_dir: str, num_images: int = 100):
         img_path = dataset_path / f"sample_{i:04d}.jpg"
         ann_path = dataset_path / f"sample_{i:04d}.txt"
        
-        img.save(img_path, 'JPEG', quality=95, optimize=True)
+        img.save(img_path, 'JPEG', quality=100, optimize=True, subsampling=0)
        
         with open(ann_path, 'w') as f:
             f.write('\n'.join(annotations))

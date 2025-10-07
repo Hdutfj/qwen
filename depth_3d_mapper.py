@@ -73,16 +73,17 @@ class DepthEstimator:
         Returns: depth map as numpy array
         """
         if not TRANSFORMERS_AVAILABLE or not self.model_available:
-            # Return a simple simulated depth map
+            # Return a more appropriate simulated depth map for scene visualization
             # In a real implementation, you might want to implement basic depth estimation
             # or use a different approach when transformers is not available
             height, width = image.height, image.width
-            # Create a simple gradient depth map (farther = brighter)
-            x = np.linspace(0, 1, width)
-            y = np.linspace(0, 1, height)
+            # Create a depth map with realistic gradient (farther = higher depth values)
+            x = np.linspace(-1, 1, width)
+            y = np.linspace(-1, 1, height)
             X, Y = np.meshgrid(x, y)
-            # Simulate depth with center being closer (convex surface effect)
-            depth_map = 0.3 + 0.7 * np.sqrt((X - 0.5)**2 + (Y - 0.5)**2)
+            # Simulate depth where center of image appears closer (realistic for indoor scenes)
+            # Values from 0.5 (far) to 2.0 (close) for better 3D visualization
+            depth_map = 0.5 + 1.5 * (1.0 - np.sqrt(np.clip(X**2 + Y**2, 0, 1)))
             return depth_map.astype(np.float32)
         
         try:
@@ -244,13 +245,15 @@ class Object3DAnchorer:
         
         # Estimate real-world dimensions based on depth (simplified)
         # In a real implementation, you would use known object dimensions or calibration
-        scale_factor = depth / 10.0  # Adjust based on actual scene scale
+        # Using a more reasonable scale factor for better visualization
+        base_scale = 1.0  # Base scale in meters
+        depth_factor = min(depth, 10.0) / 5.0  # Adjust based on depth but cap it
         
         # These are estimated values - actual implementation would require 
         # either known object sizes or additional information
-        width_3d = norm_width * 2.0 * scale_factor  # meters
-        height_3d = norm_height * 2.0 * scale_factor  # meters
-        depth_3d = norm_width * 0.5 * scale_factor   # depth assuming typical object thickness
+        width_3d = max(0.1, norm_width * 5.0 * base_scale * depth_factor)  # meters, minimum 0.1
+        height_3d = max(0.1, norm_height * 3.0 * base_scale * depth_factor)  # meters, minimum 0.1
+        depth_3d = max(0.05, norm_width * 1.0 * base_scale * depth_factor)   # depth assuming typical object thickness, minimum 0.05
         
         return [width_3d, height_3d, depth_3d]
     
@@ -294,15 +297,25 @@ class Object3DAnchorer:
                 obj_depth = self.compute_object_depth(depth_map, bbox)
                 dimensions_3d = self.estimate_object_dimensions(bbox, obj_depth, image.size)
                 
-                # Calculate center in 3D space
+                # Calculate center in 3D space - scale appropriately for better visualization
                 x1, y1, x2, y2 = bbox
                 center_x_2d = (x1 + x2) / 2
                 center_y_2d = (y1 + y2) / 2
                 
+                # Normalize coordinates to image dimensions and scale for reasonable 3D positions
+                # Convert to scene coordinates (scale down to reasonable ranges for 3D visualization)
+                norm_x = (center_x_2d - image.size[0]/2) / (image.size[0]/2)  # Range: -1 to 1
+                norm_y = (center_y_2d - image.size[1]/2) / (image.size[1]/2)  # Range: -1 to 1
+                
+                # Scale factors to make visualization more reasonable
+                x_scale = 10.0  # meters
+                y_scale = 10.0  # meters
+                z_scale = 1.0   # depth in meters
+                
                 center_3d = [
-                    (center_x_2d - image.size[0]/2) / (image.size[0]/2) * obj_depth * 0.1,  # x
-                    (center_y_2d - image.size[1]/2) / (image.size[1]/2) * obj_depth * 0.1,  # y
-                    obj_depth  # z
+                    norm_x * x_scale,  # x in meters
+                    norm_y * y_scale,  # y in meters
+                    obj_depth * z_scale  # z in meters (depth)
                 ]
             
             object_3d_info = Object3DInfo(

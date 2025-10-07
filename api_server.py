@@ -346,7 +346,7 @@ def process_single_image_enhanced(img: Image.Image):
         logger.error(f"Error processing image with enhanced model: {e}")
         return {"success": False, "error": str(e)}
 
-def draw_local_bounding_boxes(image, detections, draw_external_labels=True):
+def draw_local_bounding_boxes(image, detections, draw_external_labels=True, output_quality=95):
     """Draw bounding boxes and labels on image based on detections for the enhanced model"""
     if not detections:
         return image
@@ -413,9 +413,17 @@ def draw_local_bounding_boxes(image, detections, draw_external_labels=True):
                            outline=color, width=1)
         
         if draw_external_labels:
-            # Calculate text size for external label
+            # Calculate text size for external label with better quality font
             try:
-                font = ImageFont.load_default()
+                font_size = 14  # Larger font for better readability
+                # Try to use a better font if available
+                try:
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except:
+                    try:
+                        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+                    except:
+                        font = ImageFont.load_default()
             except:
                 font = None
 
@@ -439,9 +447,17 @@ def draw_local_bounding_boxes(image, detections, draw_external_labels=True):
                 'color': color
             })
         else:
-            # For internal labels (fallback), use the original approach
+            # For internal labels (fallback), use the original approach with better quality font
             try:
-                font = ImageFont.load_default()
+                font_size = 14  # Larger font for better readability
+                # Try to use a better font if available
+                try:
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except:
+                    try:
+                        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+                    except:
+                        font = ImageFont.load_default()
             except:
                 font = None
 
@@ -506,9 +522,17 @@ def draw_local_bounding_boxes(image, detections, draw_external_labels=True):
             draw.rectangle([label_x, label_y, label_x + text_width + 2*padding, label_y + text_height + padding], 
                            fill=info['color'], outline='black', width=1)
             
-            # Draw text
+            # Draw text with better quality font
             try:
-                font = ImageFont.load_default()
+                font_size = 14  # Larger font for better readability
+                # Try to use a better font if available
+                try:
+                    font = ImageFont.truetype("arial.ttf", font_size)
+                except:
+                    try:
+                        font = ImageFont.truetype("DejaVuSans.ttf", font_size)
+                    except:
+                        font = ImageFont.load_default()
             except:
                 font = None
             draw.text((label_x + padding, label_y + padding//2), info['label_text'], fill='white', font=font)
@@ -626,7 +650,7 @@ async def detect_objects(
             static_dir.mkdir(exist_ok=True)
             unique_id = str(uuid.uuid4())
             result_path = static_dir / f"result_{unique_id}.jpg"
-            result_image.save(result_path, "JPEG", quality=98, optimize=True)
+            result_image.save(result_path, "JPEG", quality=100, optimize=True, subsampling=0)
             result_url = f"/static/result_{unique_id}.jpg"
 
         # Extract unique object names from detections
@@ -697,7 +721,7 @@ async def detect_objects_batch(
             if result_image:
                 unique_id = str(uuid.uuid4())
                 result_path = static_dir / f"batch_openai_{unique_id}.jpg"
-                result_image.save(result_path, "JPEG", quality=98, optimize=True)
+                result_image.save(result_path, "JPEG", quality=100, optimize=True, subsampling=0)
                 result_url = f"/static/batch_openai_{unique_id}.jpg"
             
             detected_objects = list(set(det["class"] for det in detections))
@@ -766,7 +790,7 @@ async def detect_from_url(
         if result_image:
             unique_id = str(uuid.uuid4())
             result_path = static_dir / f"url_openai_{unique_id}.jpg"
-            result_image.save(result_path, "JPEG", quality=98, optimize=True)
+            result_image.save(result_path, "JPEG", quality=100, optimize=True, subsampling=0)
             result_url = f"/static/url_openai_{unique_id}.jpg"
         
         detected_objects = list(set(det["class"] for det in detections))
@@ -964,7 +988,7 @@ def test_detection():
         unique_id = str(uuid.uuid4())
         result_path = static_dir / f"test_openai_{unique_id}.jpg"
         if result_image:
-            result_image.save(result_path, "JPEG", quality=98, optimize=True)
+            result_image.save(result_path, "JPEG", quality=100, optimize=True, subsampling=0)
             result_url = f"/static/test_openai_{unique_id}.jpg"
         else:
             result_url = None
