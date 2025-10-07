@@ -61,7 +61,7 @@ class SceneDescriber:
             
             # Convert PIL image to base64 for API request
             buffer = io.BytesIO()
-            image.save(buffer, format="JPEG", quality=85)
+            image.save(buffer, format="JPEG", quality=95)
             img_base64 = b64encode(buffer.getvalue()).decode('utf-8')
             
             # Call OpenAI API for image analysis

@@ -95,7 +95,7 @@ def process_single_image_openai(img: Image.Image):
         
         # Convert PIL image to base64 for API request
         buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=85)
+        img.save(buffer, format="JPEG", quality=95)
         img_base64 = b64encode(buffer.getvalue()).decode('utf-8')
         
         # Call OpenAI API for image analysis
@@ -344,13 +344,21 @@ def process_single_image_enhanced(img: Image.Image):
         logger.error(f"Error processing image with enhanced model: {e}")
         return {"success": False, "error": str(e)}
 
-def draw_local_bounding_boxes(image, detections):
+def draw_local_bounding_boxes(image, detections, draw_external_labels=True):
     """Draw bounding boxes and labels on image based on detections for the enhanced model"""
     if not detections:
         return image
     
     # Work with a copy of the image
-    result_image = image.copy()
+    # Increase image size to have space for external labels
+    if draw_external_labels:
+        # Create a new image with additional space on the right for labels
+        new_width = int(image.width * 1.3)  # 30% more width for labels
+        result_image = Image.new('RGB', (new_width, image.height), (240, 240, 240))  # Light gray background
+        result_image.paste(image, (0, 0))
+    else:
+        result_image = image.copy()
+    
     draw = ImageDraw.Draw(result_image)
     
     # Define a color palette for different objects
@@ -360,10 +368,15 @@ def draw_local_bounding_boxes(image, detections):
         '#F8C471', '#82E0AA', '#F1948A', '#85C1E9', '#D7BDE2'
     ]
     
+    # Pre-calculate text sizes and positions for external labels
+    external_label_info = []
+    
     for i, det in enumerate(detections):
         # Get color for this object
         color = colors[i % len(colors)]
         class_name = det.get("class", "Unknown")
+        confidence = det.get("confidence", 0.0)
+        label_text = f"{class_name}: {confidence:.2f}"
         
         # Check if we have actual bounding box coordinates
         bbox = det.get("bbox", None)
@@ -371,7 +384,7 @@ def draw_local_bounding_boxes(image, detections):
         if bbox and len(bbox) == 4:
             # We have actual coordinates from detection
             x1, y1, x2, y2 = bbox
-            # Ensure coordinates are within image bounds
+            # Ensure coordinates are within original image bounds
             x1 = max(0, min(x1, image.width))
             y1 = max(0, min(y1, image.height))
             x2 = max(0, min(x2, image.width))
@@ -397,28 +410,106 @@ def draw_local_bounding_boxes(image, detections):
             draw.rectangle([x1-thickness, y1-thickness, x2+thickness, y2+thickness], 
                            outline=color, width=1)
         
-        # Draw label with background near the top-left of the bounding box
-        try:
-            font = ImageFont.load_default()
-        except:
-            font = None
+        if draw_external_labels:
+            # Calculate text size for external label
+            try:
+                font = ImageFont.load_default()
+            except:
+                font = None
 
-        if font:
-            bbox_text = draw.textbbox((0, 0), class_name, font=font)
-            text_width = bbox_text[2] - bbox_text[0]
-            text_height = bbox_text[3] - bbox_text[1]
+            if font:
+                bbox_text = draw.textbbox((0, 0), label_text, font=font)
+                text_width = bbox_text[2] - bbox_text[0]
+                text_height = bbox_text[3] - bbox_text[1]
+            else:
+                text_width, text_height = len(label_text) * 6, 11
+            
+            # Calculate position for external label on the right side
+            label_x = image.width + 20  # Start after original image
+            label_y = 20 + i * (text_height + 15)  # Space labels vertically
+            
+            # Store information for drawing arrows later
+            external_label_info.append({
+                'bbox_center': ((x1 + x2) // 2, (y1 + y2) // 2),
+                'label_pos': (label_x, label_y),
+                'label_text': label_text,
+                'text_size': (text_width, text_height),
+                'color': color
+            })
         else:
-            text_width, text_height = len(class_name) * 6, 11
+            # For internal labels (fallback), use the original approach
+            try:
+                font = ImageFont.load_default()
+            except:
+                font = None
 
-        # Position label near the top-left of the bounding box
-        label_x = max(0, x1)
-        label_y = max(0, y1 - text_height - 5)
-        
-        # Draw background rectangle for label
-        draw.rectangle([label_x, label_y, label_x + text_width + 10, label_y + text_height + 5], 
-                       fill=color)
-        # Draw text
-        draw.text((label_x + 5, label_y + 2), class_name, fill='white', font=font)
+            if font:
+                bbox_text = draw.textbbox((0, 0), label_text, font=font)
+                text_width = bbox_text[2] - bbox_text[0]
+                text_height = bbox_text[3] - bbox_text[1]
+            else:
+                text_width, text_height = len(label_text) * 6, 11
+
+            # Position label near the top-left of the bounding box
+            label_x = max(0, x1)
+            label_y = max(0, y1 - text_height - 5)
+            
+            # Draw background rectangle for label
+            draw.rectangle([label_x, label_y, label_x + text_width + 10, label_y + text_height + 5], 
+                           fill=color)
+            # Draw text
+            draw.text((label_x + 5, label_y + 2), label_text, fill='white', font=font)
+    
+    # Draw arrows and external labels if enabled
+    if draw_external_labels and external_label_info:
+        for info in external_label_info:
+            # Draw arrow from bbox center to label
+            start_x, start_y = info['bbox_center']
+            end_x, end_y = info['label_pos'][0] - 10, info['label_pos'][1] + info['text_size'][1] // 2  # Arrow points to left edge of text
+            
+            # Draw arrow line
+            draw.line([start_x, start_y, end_x, end_y], fill=info['color'], width=2)
+            
+            # Draw arrowhead
+            # Calculate direction vector
+            dx = end_x - start_x
+            dy = end_y - start_y
+            length = max(1, (dx**2 + dy**2)**0.5)
+            unit_dx = dx / length
+            unit_dy = dy / length
+            
+            # Arrowhead points
+            head_length = 10
+            head_width = 6
+            
+            # Calculate perpendicular vector for arrowhead
+            perp_dx = -unit_dy
+            perp_dy = unit_dx
+            
+            # Points for arrowhead
+            point1 = (end_x - head_length * unit_dx + head_width * perp_dx, 
+                      end_y - head_length * unit_dy + head_width * perp_dy)
+            point2 = (end_x - head_length * unit_dx - head_width * perp_dx, 
+                      end_y - head_length * unit_dy - head_width * perp_dy)
+            
+            draw.line([end_x, end_y, point1[0], point1[1]], fill=info['color'], width=2)
+            draw.line([end_x, end_y, point2[0], point2[1]], fill=info['color'], width=2)
+            
+            # Draw label with background
+            label_x, label_y = info['label_pos']
+            text_width, text_height = info['text_size']
+            
+            # Draw background rectangle for label
+            padding = 8
+            draw.rectangle([label_x, label_y, label_x + text_width + 2*padding, label_y + text_height + padding], 
+                           fill=info['color'], outline='black', width=1)
+            
+            # Draw text
+            try:
+                font = ImageFont.load_default()
+            except:
+                font = None
+            draw.text((label_x + padding, label_y + padding//2), info['label_text'], fill='white', font=font)
     
     return result_image
 
@@ -533,7 +624,7 @@ async def detect_objects(
             static_dir.mkdir(exist_ok=True)
             unique_id = str(uuid.uuid4())
             result_path = static_dir / f"result_{unique_id}.jpg"
-            result_image.save(result_path, "JPEG", quality=95)
+            result_image.save(result_path, "JPEG", quality=98, optimize=True)
             result_url = f"/static/result_{unique_id}.jpg"
 
         # Extract unique object names from detections
@@ -604,7 +695,7 @@ async def detect_objects_batch(
             if result_image:
                 unique_id = str(uuid.uuid4())
                 result_path = static_dir / f"batch_openai_{unique_id}.jpg"
-                result_image.save(result_path, "JPEG", quality=95)
+                result_image.save(result_path, "JPEG", quality=98, optimize=True)
                 result_url = f"/static/batch_openai_{unique_id}.jpg"
             
             detected_objects = list(set(det["class"] for det in detections))
@@ -673,7 +764,7 @@ async def detect_from_url(
         if result_image:
             unique_id = str(uuid.uuid4())
             result_path = static_dir / f"url_openai_{unique_id}.jpg"
-            result_image.save(result_path, "JPEG", quality=95)
+            result_image.save(result_path, "JPEG", quality=98, optimize=True)
             result_url = f"/static/url_openai_{unique_id}.jpg"
         
         detected_objects = list(set(det["class"] for det in detections))
@@ -871,7 +962,7 @@ def test_detection():
         unique_id = str(uuid.uuid4())
         result_path = static_dir / f"test_openai_{unique_id}.jpg"
         if result_image:
-            result_image.save(result_path, "JPEG", quality=95)
+            result_image.save(result_path, "JPEG", quality=98, optimize=True)
             result_url = f"/static/test_openai_{unique_id}.jpg"
         else:
             result_url = None

@@ -723,7 +723,7 @@ def create_sample_detection_dataset(dataset_dir: str, num_images: int = 100):
         img_path = dataset_path / f"sample_{i:04d}.jpg"
         ann_path = dataset_path / f"sample_{i:04d}.txt"
        
-        img.save(img_path, 'JPEG', quality=90)
+        img.save(img_path, 'JPEG', quality=95, optimize=True)
        
         with open(ann_path, 'w') as f:
             f.write('\n'.join(annotations))

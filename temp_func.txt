@@ -1,0 +1,77 @@
+def draw_local_bounding_boxes(image, detections):
+    """Draw bounding boxes and labels on image based on detections for the enhanced model"""
+    if not detections:
+        return image
+    
+    # Work with a copy of the image
+    result_image = image.copy()
+    draw = ImageDraw.Draw(result_image)
+    
+    # Define a color palette for different objects
+    colors = [
+        '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7',
+        '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E9',
+        '#F8C471', '#82E0AA', '#F1948A', '#85C1E9', '#D7BDE2'
+    ]
+    
+    for i, det in enumerate(detections):
+        # Get color for this object
+        color = colors[i % len(colors)]
+        class_name = det.get("class", "Unknown")
+        
+        # Check if we have actual bounding box coordinates
+        bbox = det.get("bbox", None)
+        
+        if bbox and len(bbox) == 4:
+            # We have actual coordinates from detection
+            x1, y1, x2, y2 = bbox
+            # Ensure coordinates are within image bounds
+            x1 = max(0, min(x1, image.width))
+            y1 = max(0, min(y1, image.height))
+            x2 = max(0, min(x2, image.width))
+            y2 = max(0, min(y2, image.height))
+        else:
+            # Fallback to a grid layout if no coordinates available
+            grid_rows = int(len(detections) ** 0.5) + 1
+            grid_cols = grid_rows
+            row = i // grid_cols
+            col = i % grid_cols
+            
+            width, height = image.size
+            x = (col + 1) * width // (grid_cols + 1)
+            y = (row + 1) * height // (grid_rows + 1)
+            
+            # Draw bounding box (using a fixed size since we don't have coordinates)
+            box_size = 60
+            x1, y1 = x - box_size//2, y - box_size//2
+            x2, y2 = x + box_size//2, y + box_size//2
+        
+        # Draw rectangle with multiple outlines for visibility
+        for thickness in range(1, 4):
+            draw.rectangle([x1-thickness, y1-thickness, x2+thickness, y2+thickness], 
+                           outline=color, width=1)
+        
+        # Draw label with background near the top-left of the bounding box
+        try:
+            font = ImageFont.load_default()
+        except:
+            font = None
+
+        if font:
+            bbox_text = draw.textbbox((0, 0), class_name, font=font)
+            text_width = bbox_text[2] - bbox_text[0]
+            text_height = bbox_text[3] - bbox_text[1]
+        else:
+            text_width, text_height = len(class_name) * 6, 11
+
+        # Position label near the top-left of the bounding box
+        label_x = max(0, x1)
+        label_y = max(0, y1 - text_height - 5)
+        
+        # Draw background rectangle for label
+        draw.rectangle([label_x, label_y, label_x + text_width + 10, label_y + text_height + 5], 
+                       fill=color)
+        # Draw text
+        draw.text((label_x + 5, label_y + 2), class_name, fill='white', font=font)
+    
+    return result_image
