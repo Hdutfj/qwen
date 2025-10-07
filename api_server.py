@@ -14,6 +14,7 @@ import numpy as np
 import base64
 from pathlib import Path
 import uuid
+import json
 import logging
 from typing import List, Optional
 import uvicorn
@@ -26,6 +27,7 @@ from base64 import b64encode
 import torch
 from enhanced_detection_model import HomeObjectDetectionModel, draw_bounding_boxes
 from api_intelligence_extension import extend_api_with_intelligence_features
+from depth_3d_mapper import AI3DSceneMapper
 
 # Define home objects
 HOME_OBJECTS = [
@@ -984,6 +986,122 @@ def test_detection():
             "test_status": "failed",
             "error": str(e)
         }
+
+
+# Initialize 3D scene mapper
+scene_mapper = None
+
+try:
+    scene_mapper = AI3DSceneMapper()
+    logger.info("3D Scene Mapper initialized successfully")
+except Exception as e:
+    logger.error(f"Error initializing 3D Scene Mapper: {e}")
+
+
+@app.post("/3d-scene-map")
+async def create_3d_scene_map(
+    image: UploadFile = File(...),
+    detection_method: str = Form("auto")
+):
+    """
+    Create a 3D reconstruction of the scene from a 2D image.
+    First performs object detection, then estimates depth and creates 3D positions.
+    """
+    if not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
+    
+    try:
+        # Read and process image
+        contents = await image.read()
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+        
+        # Perform object detection first
+        if detection_method == "auto":
+            # Use OpenAI if available, otherwise use enhanced model
+            if openai_client.api_key:
+                detection_result = process_single_image_openai(img)
+                detection_source = "openai"
+            elif enhanced_model:
+                detection_result = process_single_image_enhanced(img)
+                detection_source = "enhanced_local"
+            else:
+                raise HTTPException(status_code=500, detail="No detection models available")
+        elif detection_method == "openai":
+            if not openai_client.api_key:
+                raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+            detection_result = process_single_image_openai(img)
+            detection_source = "openai"
+        elif detection_method == "enhanced":
+            if not enhanced_model:
+                raise HTTPException(status_code=500, detail="Enhanced model not available")
+            detection_result = process_single_image_enhanced(img)
+            detection_source = "enhanced_local"
+        else:
+            raise HTTPException(status_code=400, detail="Invalid detection method. Use 'openai', 'enhanced', or 'auto'")
+        
+        if not detection_result["success"]:
+            raise HTTPException(status_code=500, detail=detection_result["error"])
+        
+        detections = detection_result["detections"]
+        
+        # Create 3D scene using the mapper
+        if scene_mapper is None:
+            raise HTTPException(status_code=500, detail="3D Scene Mapper not initialized")
+        
+        # Generate unique ID for this 3D scene
+        unique_id = str(uuid.uuid4())
+        scene_output_path = str(static_dir / f"3d_scene_{unique_id}")
+        
+        # Create 3D scene
+        scene_result = scene_mapper.create_3d_scene(
+            image=img,
+            detections=detections,
+            output_path=scene_output_path
+        )
+        
+        # Save scene data to a JSON file for web visualization
+        scene_data_path = static_dir / f"3d_scene_data_{unique_id}.json"
+        with open(scene_data_path, 'w') as f:
+            json.dump(scene_result["scene_data"], f)
+        
+        # Return the 3D scene result with a URL to the 3D visualization
+        response = {
+            "filename": image.filename,
+            "detections": detections,
+            "detection_count": len(detections),
+            "detected_objects": list(set(det["class"] for det in detections)),
+            "detection_source": detection_source,
+            "objects_3d": scene_result["objects_3d"],
+            "object_count_3d": scene_result["object_count"],
+            "success": scene_result["success"],
+            "scene_data_url": f"/static/3d_scene_data_{unique_id}.json",
+            "visualization_3d_url": f"/static/3d_visualization.html?dataUrl=/static/3d_scene_data_{unique_id}.json",
+            "visualization_2d_path": scene_result.get("visualization_path", None)
+        }
+        
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in 3D scene mapping: {e}")
+        raise HTTPException(status_code=500, detail=f"3D scene mapping failed: {str(e)}")
+
+
+@app.get("/3d-visualization")
+def get_3d_visualization():
+    """
+    Serve the 3D visualization page
+    """
+    try:
+        visualization_path = Path("static/3d_visualization.html")
+        if visualization_path.exists():
+            return FileResponse(visualization_path, media_type="text/html")
+        else:
+            return {"error": "3D visualization not found"}
+    except Exception as e:
+        logger.error(f"Error serving 3D visualization: {e}")
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     logger.info("Starting Enhanced Object Detection API Server using OpenAI API")

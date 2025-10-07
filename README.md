@@ -1,14 +1,18 @@
-# Home Objects Detection System
+# Home Objects Detection System with AI 3D Scene Mapper
 
-This project implements a complete object detection system for home objects using PyTorch, FastAPI, and React. It allows users to upload images and receive processed images with bounding boxes drawn around detected home objects.
+This project implements a complete object detection system for home objects using PyTorch, FastAPI, and React. It allows users to upload images and receive processed images with bounding boxes drawn around detected home objects. NEW: Advanced AI 3D Scene Mapping feature that converts 2D images to interactive 3D environments!
 
 ## Features
 
-- **Object Detection**: Detects 15 different home objects including chairs, sofas, beds, tables, etc.
+- **Object Detection**: Detects 25+ different home objects including toilets, sinks, mirrors, bathtubs, towels, etc.
 - **Web Interface**: Clean, responsive React frontend for easy image upload and result viewing
 - **API Backend**: FastAPI server for handling image processing requests
 - **Real-time Results**: Instant visualization of detected objects with bounding boxes
 - **Configurable**: Adjustable confidence threshold for detection sensitivity
+- **AI 3D Scene Mapper**: NEW! Advanced feature that converts 2D images to interactive 3D environments
+- **Depth Estimation**: Uses state-of-the-art models (DPT, MiDaS) to estimate depth from 2D images
+- **3D Reconstruction**: Places detected objects in 3D space with realistic spatial relationships
+- **Interactive Visualization**: Three.js-based 3D viewer for exploring the reconstructed scene
 
 ## System Architecture
 
@@ -97,25 +101,37 @@ This project implements a complete object detection system for home objects usin
 - `GET /health` - Health check
 - `GET /classes` - List of detectable classes
 - `GET /docs` - Interactive API documentation
+- `POST /3d-scene-map` - Create 3D reconstruction from 2D image (NEW!)
+- `GET /3d-visualization` - Serve 3D visualization interface (NEW!)
 
 ## Model Classes
 
 The system can detect the following home objects:
-- Chair
-- Sofa
-- Bed
-- Dining Table
 - Toilet
-- TV
-- Laptop
-- Mouse
-- Oven
-- Toaster
-- Refrigerator
-- Book
-- Clock
-- Vase
-- Window
+- Sink
+- Mirror
+- Bathtub
+- Showerhead
+- Towel
+- Toothbrush
+- Toothpaste
+- Soap Bar
+- Shampoo Bottle
+- Conditioner Bottle
+- Handwash Bottle
+- Toilet Paper Roll
+- Towel Rack
+- Bath Mat
+- Hair Dryer
+- Razor
+- Lotion Bottle
+- Trash Bin
+- Shower Curtain
+- Comb
+- Cleaning Brush
+- Bucket
+- Mug
+- Bathroom Shelf
 
 ## Development
 
