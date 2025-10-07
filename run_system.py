@@ -18,25 +18,45 @@ logger = logging.getLogger(__name__)
 def check_model_exists():
     """Check if the trained model exists"""
     model_path = Path("home_objects_detection_model.pth")
-    return model_path.exists()
+    enhanced_model_path = Path("enhanced_detection_model.pth")
+    return model_path.exists() or enhanced_model_path.exists()
 
 def train_model_if_needed():
-    """Train the model if it doesn't exist"""
-    if not check_model_exists():
-        logger.info("Model not found. Starting training...")
+    """Train the models if they don't exist"""
+    model_path = Path("home_objects_detection_model.pth")
+    enhanced_model_path = Path("enhanced_detection_model.pth")
+    
+    # Check if any model exists
+    if not model_path.exists() and not enhanced_model_path.exists():
+        logger.info("No models found. Starting training for basic model...")
         try:
             from object_detection_model import main as train_main
             train_main()
-            if check_model_exists():
-                logger.info("Model training completed successfully!")
+            if model_path.exists():
+                logger.info("Basic model training completed successfully!")
             else:
-                logger.error("Model training may have failed. Model file not found.")
+                logger.error("Basic model training may have failed. Model file not found.")
                 return False
         except Exception as e:
-            logger.error(f"Error during model training: {e}")
+            logger.error(f"Error during basic model training: {e}")
+            return False
+    
+    # Check if enhanced model exists
+    if not enhanced_model_path.exists():
+        logger.info("Enhanced model not found. Starting training for enhanced model...")
+        try:
+            from enhanced_detection_model import main as enhanced_train_main
+            enhanced_train_main()
+            if enhanced_model_path.exists():
+                logger.info("Enhanced model training completed successfully!")
+            else:
+                logger.error("Enhanced model training may have failed. Model file not found.")
+                return False
+        except Exception as e:
+            logger.error(f"Error during enhanced model training: {e}")
             return False
     else:
-        logger.info("Model already exists. Skipping training.")
+        logger.info("Enhanced model already exists. Skipping training.")
     
     return True
 

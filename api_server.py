@@ -1,6 +1,6 @@
 """
 Enhanced FastAPI Backend for Object Detection
-Using OpenAI API for object detection
+Supports both OpenAI API and local enhanced detection model with smart features
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -23,6 +23,17 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from dotenv import load_dotenv
 from base64 import b64encode
+import torch
+from enhanced_detection_model import HomeObjectDetectionModel, draw_bounding_boxes
+from api_intelligence_extension import extend_api_with_intelligence_features
+
+# Define home objects
+HOME_OBJECTS = [
+    'toilet', 'sink', 'mirror', 'bathtub', 'showerhead', 'towel', 'toothbrush', 
+    'toothpaste', 'soap_bar', 'shampoo_bottle', 'conditioner_bottle', 'handwash_bottle', 
+    'toilet_paper_roll', 'towel_rack', 'bath_mat', 'hair_dryer', 'razor', 'lotion_bottle', 
+    'trash_bin', 'shower_curtain', 'comb', 'cleaning_brush', 'bucket', 'mug', 'bathroom_shelf'
+]
 
 # Load environment variables from .env file
 load_dotenv()
@@ -34,9 +45,23 @@ logger = logging.getLogger(__name__)
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-if not openai_client.api_key:
-    logger.error("OPENAI_API_KEY not found in environment variables")
-    raise ValueError("OPENAI_API_KEY is required")
+# Load enhanced detection model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+enhanced_model = None
+model_path = "enhanced_detection_model.pth"
+
+if os.path.exists(model_path):
+    try:
+        enhanced_model = HomeObjectDetectionModel()
+        enhanced_model.load_state_dict(torch.load(model_path, map_location=device))
+        enhanced_model.to(device)
+        logger.info("Enhanced detection model loaded successfully")
+    except Exception as e:
+        logger.error(f"Error loading enhanced detection model: {e}")
+
+if not openai_client.api_key and enhanced_model is None:
+    logger.error("No detection models available - please provide OPENAI_API_KEY or ensure enhanced model is trained")
+    raise ValueError("No detection models available")
 
 app = FastAPI(
     title="Enhanced Object Detection API",
@@ -213,8 +238,114 @@ def process_single_image_openai(img: Image.Image):
         logger.error(f"Error processing image with OpenAI API: {e}")
         return {"success": False, "error": str(e)}
 
+def process_single_image_enhanced(img: Image.Image):
+    """Process a single PIL Image using the enhanced local model with smart features"""
+    if enhanced_model is None:
+        return {"success": False, "error": "Enhanced model not available"}
+    
+    try:
+        start_time = time.time()
+        
+        # Preprocess image for model
+        transform = torch.nn.Sequential(
+            torch.nn.Resize((416, 416)),
+            torch.nn.ToTensor(),
+            torch.nn.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        )
+        
+        # Convert PIL to tensor and add batch dimension
+        img_tensor = transform(img).unsqueeze(0).to(device)
+        
+        # Run enhanced prediction
+        detections = enhanced_model.predict(img_tensor)
+        
+        # Process detections into expected format
+        detection_results = []
+        
+        # The detections format may vary, so we adjust accordingly
+        if detections:
+            for batch_dets in detections:
+                # Remove relationships dict if present for processing
+                relationships = None
+                fine_grained_info = None
+                if len(batch_dets) > 0 and isinstance(batch_dets[-1], dict):
+                    last_item = batch_dets[-1]
+                    if "relationships" in last_item:
+                        relationships = batch_dets.pop()
+                    elif "fine_grained_classification" in last_item:
+                        fine_grained_info = batch_dets.pop()
+                
+                for det in batch_dets:
+                    if isinstance(det, (list, tuple)) and len(det) >= 6:
+                        x_center, y_center, width, height, conf, cls_id = det
+                        
+                        # Convert normalized coordinates to pixel coordinates
+                        x1 = int((x_center - width/2) * img.width)
+                        y1 = int((y_center - height/2) * img.height)
+                        x2 = int((x_center + width/2) * img.width)
+                        y2 = int((y_center + height/2) * img.height)
+                        
+                        # Calculate center and size
+                        center_x = (x1 + x2) / 2
+                        center_y = (y1 + y2) / 2
+                        size_w = x2 - x1
+                        size_h = y2 - y1
+                        
+                        # Calculate area percentage
+                        object_area = size_w * size_h
+                        total_area = img.width * img.height
+                        area_percentage = (object_area / total_area) * 100 if total_area > 0 else 0
+                        
+                        # Get class name from extended classes
+                        class_name = "unknown"
+                        if isinstance(cls_id, torch.Tensor):
+                            cls_id = cls_id.item()
+                        cls_id = int(cls_id)
+                        if cls_id < len(enhanced_model.EXTENDED_CLASSES if hasattr(enhanced_model, 'EXTENDED_CLASSES') else []):
+                            class_name = enhanced_model.EXTENDED_CLASSES[cls_id]
+                        elif cls_id < len(HOME_OBJECTS):
+                            class_name = HOME_OBJECTS[cls_id]
+                        else:
+                            class_name = f"class_{cls_id}"
+                        
+                        detection_result = {
+                            "class": class_name,
+                            "confidence": conf,
+                            "bbox": [x1, y1, x2, y2],  # Bounding box in pixel coordinates
+                            "center": [center_x, center_y],
+                            "size": [size_w, size_h],
+                            "area_percentage": area_percentage,
+                            "image_width": img.width,
+                            "image_height": img.height
+                        }
+                        
+                        # Add relationship info if available
+                        if relationships:
+                            detection_result["relationships"] = relationships
+                        
+                        # Add fine-grained info if available
+                        if fine_grained_info:
+                            detection_result["fine_grained_info"] = fine_grained_info
+                        
+                        detection_results.append(detection_result)
+        
+        inference_time = time.time() - start_time
+        
+        return {
+            "success": True,
+            "detections": detection_results,
+            "result_image": img,
+            "inference_time": inference_time,
+            "image_size": (img.width, img.height),
+            "model_type": "enhanced_local"
+        }
+    
+    except Exception as e:
+        logger.error(f"Error processing image with enhanced model: {e}")
+        return {"success": False, "error": str(e)}
+
 def draw_local_bounding_boxes(image, detections):
-    """Draw bounding boxes and labels on image based on detections - using actual coordinates when available from OpenAI"""
+    """Draw bounding boxes and labels on image based on detections for the enhanced model"""
     if not detections:
         return image
     
@@ -238,7 +369,7 @@ def draw_local_bounding_boxes(image, detections):
         bbox = det.get("bbox", None)
         
         if bbox and len(bbox) == 4:
-            # We have actual coordinates from OpenAI
+            # We have actual coordinates from detection
             x1, y1, x2, y2 = bbox
             # Ensure coordinates are within image bounds
             x1 = max(0, min(x1, image.width))
@@ -294,21 +425,26 @@ def draw_local_bounding_boxes(image, detections):
 @app.get("/")
 def read_root():
     return {
-        "message": "Enhanced Object Detection API",
-        "version": "2.0.0",
+        "message": "Enhanced Object Detection API with Smart Features",
+        "version": "3.0.0",
         "features": [
             "Bathroom object detection",
             "Fast inference",
             "High accuracy detection",
-            "Single and batch processing support"
+            "Single and batch processing support",
+            "Auto-Label Refinement",
+            "Multi-Object Context Awareness",
+            "Fine-Grained Classification",
+            "Self-Improving Feedback Loop"
         ],
         "endpoints": {
-            "/detect": "Single image detection",
+            "/detect": "Single image detection (with method selection)",
             "/detect-batch": "Batch image detection",
             "/detect-url": "Detect from image URL",
             "/classes": "List all detectable classes",
             "/health": "API health check",
-            "/stats": "Detection statistics"
+            "/stats": "Detection statistics",
+            "/smart-features": "Information about smart detection features"
         }
     }
 
@@ -317,10 +453,11 @@ async def detect_objects(
     request: Request,
     image: Optional[UploadFile] = File(None),
     # Remove confidence_threshold since OpenAI doesn't use it
-    draw_boxes: bool = Form(True)
+    draw_boxes: bool = Form(True),
+    detection_method: str = Form("auto")  # "openai", "enhanced", or "auto"
 ):
     """
-    Detect objects in an uploaded image using OpenAI API.
+    Detect objects in an uploaded image using OpenAI API or enhanced local model.
     Handles both file uploads and raw binary image input.
     """
     # Pre-read request body if image is None to avoid "Stream consumed" error in exception handling
@@ -352,8 +489,30 @@ async def detect_objects(
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid image file or corrupted data.")
 
-        # Run model prediction with the PIL Image using OpenAI API
-        result = process_single_image_openai(img)
+        # Determine which detection method to use
+        if detection_method == "auto":
+            # Use OpenAI if available, otherwise use enhanced model
+            if openai_client.api_key:
+                result = process_single_image_openai(img)
+                detection_source = "openai"
+            elif enhanced_model:
+                result = process_single_image_enhanced(img)
+                detection_source = "enhanced_local"
+            else:
+                raise HTTPException(status_code=500, detail="No detection models available")
+        elif detection_method == "openai":
+            if not openai_client.api_key:
+                raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+            result = process_single_image_openai(img)
+            detection_source = "openai"
+        elif detection_method == "enhanced":
+            if not enhanced_model:
+                raise HTTPException(status_code=500, detail="Enhanced model not available")
+            result = process_single_image_enhanced(img)
+            detection_source = "enhanced_local"
+        else:
+            raise HTTPException(status_code=400, detail="Invalid detection method. Use 'openai', 'enhanced', or 'auto'")
+
         if not result["success"]:
             raise HTTPException(status_code=500, detail=result["error"])
 
@@ -361,7 +520,10 @@ async def detect_objects(
 
         # --- Draw bounding boxes ---
         if draw_boxes:
-            result_image = draw_local_bounding_boxes(img.copy(), detections)
+            if detection_source == "enhanced_local":
+                result_image = draw_local_bounding_boxes(img.copy(), detections)
+            else:
+                result_image = draw_local_bounding_boxes(img.copy(), detections)
         else:
             result_image = img
 
@@ -384,7 +546,8 @@ async def detect_objects(
             "detected_objects": detected_objects,  # List of unique objects found
             "result_image_url": result_url,
             "inference_time_ms": round(result["inference_time"] * 1000, 2),
-            "image_size": result["image_size"]
+            "image_size": result["image_size"],
+            "detection_source": detection_source
         }
 
     except HTTPException:
@@ -551,39 +714,69 @@ def get_classes():
 @app.get("/health")
 def health_check():
     try:
-        # Test OpenAI API connection
         start_time = time.time()
         
-        # Create a dummy 1x1 pixel image for testing
-        dummy_img = Image.new('RGB', (10, 10), color='white')
-        result = process_single_image_openai(dummy_img)
+        # Test OpenAI API connection if available
+        openai_status = None
+        openai_inference_time = None
+        if openai_client.api_key:
+            try:
+                # Create a dummy 1x1 pixel image for testing
+                dummy_img = Image.new('RGB', (10, 10), color='white')
+                result = process_single_image_openai(dummy_img)
+                openai_inference_time = time.time() - start_time
+                openai_status = result["success"]
+            except Exception:
+                openai_status = False
         
-        inference_time = time.time() - start_time
+        # Test enhanced model if available
+        enhanced_status = None
+        enhanced_inference_time = None
+        if enhanced_model:
+            try:
+                test_img = Image.new('RGB', (416, 416), color='white')
+                result = process_single_image_enhanced(test_img)
+                enhanced_inference_time = time.time() - start_time
+                enhanced_status = result["success"]
+            except Exception:
+                enhanced_status = False
         
         return {
             "status": "healthy",
             "openai_api_key_set": bool(openai_client.api_key),
-            "inference_test_ms": round(inference_time * 1000, 2),
-            "api_version": "2.0.0"
+            "openai_available": openai_status,
+            "openai_inference_test_ms": round(openai_inference_time * 1000, 2) if openai_inference_time else None,
+            "enhanced_model_available": enhanced_status,
+            "enhanced_inference_test_ms": round(enhanced_inference_time * 1000, 2) if enhanced_inference_time else None,
+            "api_version": "3.0.0"
         }
     except Exception as e:
         return {
             "status": "unhealthy",
             "error": str(e),
-            "openai_api_key_set": bool(openai_client.api_key)
+            "openai_api_key_set": bool(openai_client.api_key),
+            "enhanced_model_loaded": enhanced_model is not None
         }
 
 @app.get("/stats")
 def get_stats():
     return {
         "model_info": {
-            "service": "OpenAI GPT-4 Vision",
-            "api_provider": "OpenAI",
-            "detection_method": "Cloud-based image analysis"
+            "openai_service": "OpenAI GPT-4 Vision",
+            "openai_provider": "OpenAI",
+            "openai_detection_method": "Cloud-based image analysis",
+            "enhanced_detection_model": "Local CNN with smart features",
+            "enhanced_features": [
+                "Auto-Label Refinement",
+                "Multi-Object Context Awareness", 
+                "Fine-Grained Classification",
+                "Self-Improving Feedback Loop"
+            ]
         },
         "performance": {
-            "api_based": True,
-            "network_required": True,
+            "openai_api_based": openai_client.api_key is not None,
+            "local_model_available": enhanced_model is not None,
+            "network_required_for_openai": openai_client.api_key is not None,
             "batch_processing": True,
             "parallel_inference": True
         },
@@ -592,7 +785,56 @@ def get_stats():
             "batch_processing": True,
             "url_detection": True,
             "object_recognition": True,
-            "detailed_analysis": True
+            "detailed_analysis": True,
+            "smart_detection_features": True,
+            "multi_method_support": True
+        }
+    }
+
+
+@app.get("/smart-features")
+def get_smart_features():
+    """Information about the smart detection features"""
+    return {
+        "smart_features": {
+            "auto_label_refinement": {
+                "description": "Uses DBSCAN clustering to merge overlapping boxes and remove low-confidence detections intelligently",
+                "benefits": [
+                    "Reduces duplicate detections",
+                    "Improves detection accuracy",
+                    "Self-improving feedback loop"
+                ]
+            },
+            "multi_object_context_awareness": {
+                "description": "Scene Graph Model to understand relationships between objects (e.g., 'Toothbrush on sink' or 'Laptop on desk')",
+                "benefits": [
+                    "Semantic intelligence", 
+                    "Understanding of spatial relationships",
+                    "Contextual awareness"
+                ]
+            },
+            "fine_grained_classification": {
+                "description": "Secondary classifier for sub-type detection (e.g., 'chair → office chair / dining chair / gaming chair')",
+                "benefits": [
+                    "More detailed object identification",
+                    "Sub-type classification",
+                    "Enhanced categorization"
+                ]
+            },
+            "self_improving_feedback_loop": {
+                "description": "Learns from user corrections to improve future detections",
+                "benefits": [
+                    "Continuous improvement",
+                    "Adapts to user preferences",
+                    "Better accuracy over time"
+                ]
+            }
+        },
+        "implementation_details": {
+            "post_processing": "Lightweight transformer and rule-based filter",
+            "scene_graph_model": "Detectron + Graph R-CNN implementation",
+            "fine_grained_classifier": "CNN-based secondary classifier",
+            "feedback_system": "In-memory storage with confidence adjustments"
         }
     }
 
