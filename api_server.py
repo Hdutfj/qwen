@@ -2,10 +2,11 @@
 Enhanced FastAPI Backend for Object Detection
 Supports both OpenAI API and local enhanced detection model with smart features
 """
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request, Depends
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
 import requests
 from openai import OpenAI
 from PIL import Image, ImageDraw, ImageFont
@@ -25,6 +26,10 @@ import os
 from dotenv import load_dotenv
 from base64 import b64encode
 import torch
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from pydantic import BaseModel, EmailStr
 from enhanced_detection_model import HomeObjectDetectionModel, draw_bounding_boxes
 from api_intelligence_extension import extend_api_with_intelligence_features
 from depth_3d_mapper import AI3DSceneMapper
@@ -43,6 +48,15 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Security constants
+SECRET_KEY = os.getenv("SECRET_KEY", "your_secret_key_here")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Security instances
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -128,7 +142,6 @@ def process_single_image_openai(img: Image.Image):
         result_text = response.choices[0].message.content
         logger.info(f"OpenAI response: {result_text}")
         
-        import json
         try:
             # Try to parse the JSON response
             result = json.loads(result_text)
@@ -581,7 +594,8 @@ def read_root():
             "/classes": "List all detectable classes",
             "/health": "API health check",
             "/stats": "Detection statistics",
-            "/smart-features": "Information about smart detection features"
+            "/smart-features": "Information about smart detection features",
+            "/chatbot": "AI-related chatbot query"
         }
     }
 
@@ -1072,7 +1086,6 @@ try:
 except Exception as e:
     logger.error(f"Error initializing 3D Scene Mapper: {e}")
 
-
 @app.post("/3d-scene-map")
 async def create_3d_scene_map(
     image: UploadFile = File(...),
@@ -1177,6 +1190,198 @@ def get_3d_visualization():
     except Exception as e:
         logger.error(f"Error serving 3D visualization: {e}")
         return {"error": str(e)}
+
+@app.post("/chatbot")
+async def chatbot_query(
+    question: str = Form(...),
+):
+    """
+    AI-related chatbot endpoint. Answers questions only if they are related to the AI field.
+    Uses OpenAI's GPT-4o model for accurate and correct responses.
+    """
+    if not openai_client.api_key:
+        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
+    try:
+        # First, check if the question is related to AI
+        check_response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a classifier. Determine if the user's question is related to AI (Artificial Intelligence), machine learning, neural networks, computer vision, NLP, or related fields. Respond with only 'YES' or 'NO'."
+                },
+                {
+                    "role": "user",
+                    "content": question
+                }
+            ],
+            max_tokens=1,
+            temperature=0.0
+        )
+        
+        is_ai_related = check_response.choices[0].message.content.strip().upper() == "YES"
+        
+        if not is_ai_related:
+            return {"response": "This chatbot only answers questions related to the AI field."}
+        
+        # If related, generate accurate response
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert in AI. Provide accurate, factual, and correct answers based on established knowledge in the AI field. Be concise and informative. Do not speculate or provide misinformation."
+                },
+                {
+                    "role": "user",
+                    "content": question
+                }
+            ],
+            max_tokens=500,
+            temperature=0.2  # Low temperature for factual accuracy
+        )
+        
+        answer = response.choices[0].message.content.strip()
+        
+        return {"response": answer}
+        
+    except Exception as e:
+        logger.error(f"Error in chatbot endpoint: {e}")
+        raise HTTPException(status_code=500, detail="Chatbot query failed")
+    
+fake_users_db = {}
+
+# ============================================================
+# MODELS
+# ============================================================
+class User(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+# ============================================================
+# UTILS
+# ============================================================
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# ============================================================
+# AUTH ENDPOINTS
+# ============================================================
+
+@app.post("/register")
+async def register(user: User):
+    """Register a new user"""
+    if user.email in fake_users_db:
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    hashed_pw = hash_password(user.password)
+    fake_users_db[user.email] = {
+        "name": user.name,
+        "email": user.email,
+        "password": hashed_pw
+    }
+
+    return {"success": True, "message": "Registration successful"}
+
+@app.post("/login")
+async def login(user: UserLogin):
+    """Authenticate user"""
+    stored_user = fake_users_db.get(user.email)
+    if not stored_user or not verify_password(user.password, stored_user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": stored_user["email"]}, expires_delta=access_token_expires
+    )
+
+    return {"success": True, "message": "Login successful", "access_token": access_token}
+
+
+@app.post("/api/auth/register")
+async def register_api(user: User):
+    """Register a new user - API endpoint for frontend"""
+    if user.email in fake_users_db:
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    hashed_pw = hash_password(user.password)
+    fake_users_db[user.email] = {
+        "name": user.name,
+        "email": user.email,
+        "password": hashed_pw
+    }
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+
+    return {"success": True, "user": {"name": user.name, "email": user.email}, "token": access_token}
+
+
+@app.post("/api/auth/login")
+async def login_api(user: UserLogin):
+    """Authenticate user - API endpoint for frontend"""
+    stored_user = fake_users_db.get(user.email)
+    if not stored_user or not verify_password(user.password, stored_user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": stored_user["email"]}, expires_delta=access_token_expires
+    )
+
+    return {"success": True, "user": {"name": stored_user["name"], "email": stored_user["email"]}, "token": access_token}
+
+
+@app.get("/api/auth/profile")
+async def get_profile(token: str = Depends(oauth2_scheme)):
+    """Get user profile - API endpoint for frontend"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None or email not in fake_users_db:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        
+        user = fake_users_db[email]
+        return {"user": {"name": user["name"], "email": user["email"]}}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token invalid or expired")
+
+# ============================================================
+# PROTECTED ENDPOINT (for testing)
+# ============================================================
+@app.get("/protected")
+async def protected_route(token: str = Depends(oauth2_scheme)):
+    """Test protected route"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None or email not in fake_users_db:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return {"success": True, "message": f"Welcome, {fake_users_db[email]['name']}!"}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token invalid or expired")
 
 if __name__ == "__main__":
     logger.info("Starting Enhanced Object Detection API Server using OpenAI API")
